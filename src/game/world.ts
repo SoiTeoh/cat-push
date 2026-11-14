@@ -1,13 +1,24 @@
 import Matter from 'matter-js';
 import { STAGES } from '../config/stages';
-import { tuning, type ItemKind, type ItemSpec, type Tuning } from '../config/tuning';
+import {
+  tuning,
+  type DifficultyMode,
+  type ItemKind,
+  type ItemSpec,
+  type Tuning,
+} from '../config/tuning';
 import {
   buildWaveLayout,
   calculateDropScore,
   clamp,
+  computeRestoredX,
   evaluateTeeterState,
   isFragileBrokenOnTable,
+  pickRestoreTarget,
+  shouldBlockCatHorizontally,
+  stepCatJump,
   stepPhoneBuzz,
+  type DisplacedItemSnapshot,
   type TeeterTier,
 } from './rules';
 
@@ -16,6 +27,7 @@ export interface TableItem {
   readonly kind: ItemKind;
   readonly spec: ItemSpec;
   readonly body: Matter.Body;
+  readonly originX: number;
   teeterHoldSec: number;
   teeterTier: TeeterTier;
   multiplier: 1 | 2 | 3;
@@ -23,6 +35,8 @@ export interface TableItem {
   settledAfterDrop: boolean;
   buzzCycleSec: number;
   isBuzzing: boolean;
+  restoreGraceSec: number;
+  tapCoastSec: number;
 }
 
 export interface CatState {
@@ -39,6 +53,10 @@ export interface CatState {
   /** 是否正用力推重物 */
   pushingHeavy: boolean;
   tapCooldownSec: number;
+  jumpTimerSec: number;
+  jumpHeightPx: number;
+  autoHopVx: number;
+  meowBubbleSec: number;
 }
 
 export interface DroppedNotice {
@@ -56,6 +74,8 @@ export interface WorldStepResult {
   readonly addedNoise: number;
   readonly hasMovingItem: boolean;
   readonly hasTeeteringItem: boolean;
+  readonly teeteringItemLabel: string | null;
+  readonly restoreCandidate: DisplacedItemSnapshot | null;
   readonly waveCleared: boolean;
   readonly phoneBuzzed: boolean;
 }
@@ -127,6 +147,10 @@ export class CatPushWorld {
       isActive: false,
       pushingHeavy: false,
       tapCooldownSec: 0,
+      jumpTimerSec: 0,
+      jumpHeightPx: 0,
+      autoHopVx: 0,
+      meowBubbleSec: 0,
     };
 
     this.spawnWave(1, initialItems);
@@ -142,7 +166,7 @@ export class CatPushWorld {
     this.items.length = 0;
     this.waveCount = waveNumber;
 
-    const layout = buildWaveLayout(waveNumber, stageItems, this.t.scene.tableEdgeX);
+    const layout = buildWaveLayout(waveNumber, stageItems, this.t.scene.tableEdgeX, Math.random, this.t);
     for (const slot of layout) {
       this.spawnItem(slot.kind, slot.x);
     }
@@ -150,7 +174,7 @@ export class CatPushWorld {
 
   public spawnItem(kind: ItemKind, x: number): TableItem {
     const spec = this.t.items[kind];
-    const spawnY = this.t.scene.tableTopY - spec.height / 2 - 1;
+    const spawnY = this.t.scene.tableTopY - spec.height / 2 - 0.1;
 
     const common: Matter.IBodyDefinition = {
       label: `item:${kind}`,
@@ -183,6 +207,7 @@ export class CatPushWorld {
       kind,
       spec,
       body,
+      originX: x,
       teeterHoldSec: 0,
       teeterTier: 'safe',
       multiplier: 1,
@@ -190,8 +215,36 @@ export class CatPushWorld {
       settledAfterDrop: false,
       buzzCycleSec: 0.8,
       isBuzzing: false,
+      restoreGraceSec: 0,
+      tapCoastSec: 0,
     };
     this.items.push(item);
+    return item;
+  }
+
+  public restoreItemById(itemId: number, difficulty: DifficultyMode = 'normal'): TableItem | null {
+    const item = this.items.find((it) => it.id === itemId && !it.dropped);
+    if (!item) return null;
+    const wasTeetering = item.multiplier >= 2 || item.teeterTier !== 'safe';
+    let restoredX = computeRestoredX(
+      item.body.position.x,
+      item.originX,
+      this.t.difficulties[difficulty].restorePullRatio,
+    );
+    if (wasTeetering) {
+      restoredX = Math.min(restoredX, this.t.scene.tableEdgeX - 42);
+    }
+    Matter.Body.setPosition(item.body, {
+      x: restoredX,
+      y: this.t.scene.tableTopY - item.spec.height / 2 - 0.2,
+    });
+    Matter.Body.setVelocity(item.body, { x: 0, y: 0 });
+    Matter.Body.setAngularVelocity(item.body, 0);
+    Matter.Body.setAngle(item.body, 0);
+    item.teeterHoldSec = 0;
+    item.teeterTier = 'safe';
+    item.multiplier = 1;
+    item.restoreGraceSec = 0.65;
     return item;
   }
 
@@ -199,8 +252,16 @@ export class CatPushWorld {
    * 推进一步固定物理步长：
    * moveDir: -1(左) | 0(停/装睡) | 1(右推)
    * tapTriggered: 是否触发一次高风险“快速轻拍”
+   * jumpTriggered: 是否触发一次“轻跳跨越”
    */
-  public step(moveDir: -1 | 0 | 1, tapTriggered: boolean, dtMs: number): WorldStepResult {
+  public step(
+    moveDir: -1 | 0 | 1,
+    tapTriggered: boolean,
+    jumpTriggered: boolean,
+    dtMs: number,
+    difficulty: DifficultyMode = 'normal',
+    excludeRestoreIds?: ReadonlySet<number>,
+  ): WorldStepResult {
     const dtSec = dtMs / 1000;
     let addedNoise = 0;
     let pushingAny = false;
@@ -208,34 +269,79 @@ export class CatPushWorld {
     let phoneBuzzed = false;
 
     this.cat.tapCooldownSec = Math.max(0, this.cat.tapCooldownSec - dtSec);
+    this.cat.meowBubbleSec = Math.max(0, this.cat.meowBubbleSec - dtSec);
 
-    const canTap = tapTriggered && this.cat.tapCooldownSec <= 0;
+    const wasAirborne = this.cat.jumpTimerSec > 0;
+    const jumpRes = stepCatJump(this.cat.jumpTimerSec, jumpTriggered, dtSec, this.t);
+    this.cat.jumpTimerSec = jumpRes.nextJumpTimerSec;
+    this.cat.jumpHeightPx = jumpRes.heightOffsetPx;
+
+    // 单指/单鼠标点击「跳」且未按方向键时，若前方紧邻桌面物品则自动给予向右跨栏抛物线初速度
+    if (!wasAirborne && jumpRes.isAirborne && moveDir === 0) {
+      let hopVx = 0;
+      for (const item of this.items) {
+        if (item.dropped || item.body.position.y > this.t.scene.tableTopY + 12) continue;
+        const leftEdge = item.body.position.x - item.spec.width * 0.5;
+        const rightEdge = item.body.position.x + item.spec.width * 0.5;
+        if (leftEdge - this.cat.x <= 48 && rightEdge >= this.cat.x) {
+          hopVx = clamp(
+            (item.spec.width + this.t.cat.bodyHalfW * 2 + 14) / this.t.cat.jumpDurationSec,
+            175,
+            250,
+          );
+          break;
+        }
+      }
+      this.cat.autoHopVx = hopVx;
+    } else if (!jumpRes.isAirborne) {
+      this.cat.autoHopVx = 0;
+    }
+
+    const canTap = tapTriggered && this.cat.tapCooldownSec <= 0 && !jumpRes.isAirborne;
     if (canTap) {
       this.cat.tapCooldownSec = this.t.cat.tapCooldownSec;
       addedNoise += this.t.cat.tapNoiseSpike;
     }
 
-    const activeInput = moveDir !== 0 || canTap;
+    const activeInput = moveDir !== 0 || canTap || jumpRes.isAirborne;
     this.cat.isActive = activeInput;
 
     if (activeInput) {
       this.cat.idleSec = 0;
       this.cat.alertness = clamp(this.cat.alertness + dtSec / 0.08, 0, 1);
+      const effectiveVx =
+        moveDir !== 0
+          ? moveDir * this.t.cat.moveSpeed
+          : jumpRes.isAirborne
+            ? this.cat.autoHopVx
+            : 0;
       if (moveDir !== 0) {
         this.cat.facing = moveDir;
+      } else if (effectiveVx > 0) {
+        this.cat.facing = 1;
+      }
+      if (effectiveVx !== 0) {
         let nextX = clamp(
-          this.cat.x + moveDir * this.t.cat.moveSpeed * dtSec,
+          this.cat.x + effectiveVx * dtSec,
           this.t.cat.minX,
           this.t.cat.maxX,
         );
-        // 防止猫身穿过桌面物体：向右推时猫身停靠在物体左边缘外侧，只伸前爪抵住左侧面
-        if (moveDir > 0) {
-          for (const item of this.items) {
-            if (item.dropped || item.body.position.y > this.t.scene.tableTopY + 12) continue;
-            const leftEdge = item.body.position.x - item.spec.width * 0.5;
-            if (this.cat.x <= item.body.position.x && nextX + this.t.cat.bodyHalfW > leftEdge - 2) {
-              nextX = Math.min(nextX, Math.max(this.t.cat.minX, leftEdge - this.t.cat.bodyHalfW - 2));
-            }
+        // 仅在地面时受桌面物体水平阻挡；跳跃滞空期间直接越过障碍物
+        for (const item of this.items) {
+          if (item.dropped || item.body.position.y > this.t.scene.tableTopY + 12) continue;
+          const leftEdge = item.body.position.x - item.spec.width * 0.5;
+          if (
+            shouldBlockCatHorizontally(
+              this.cat.x,
+              nextX,
+              moveDir,
+              jumpRes.isAirborne,
+              leftEdge,
+              item.body.position.x,
+              this.t.cat.bodyHalfW,
+            )
+          ) {
+            nextX = Math.min(nextX, Math.max(this.t.cat.minX, leftEdge - this.t.cat.bodyHalfW - 2));
           }
         }
         this.cat.x = nextX;
@@ -249,9 +355,27 @@ export class CatPushWorld {
       );
     }
 
-    // 接触物品推力逻辑（仅在猫向右主动推或轻拍时施力，避免装睡误碰）
+    // 落地防卡死引导：若恰好落在物体正上方，轻柔滑向最近的安全空隙
+    if (wasAirborne && !jumpRes.isAirborne) {
+      for (const item of this.items) {
+        if (item.dropped || item.body.position.y > this.t.scene.tableTopY + 12) continue;
+        const leftSafe = item.body.position.x - item.spec.width * 0.5 - this.t.cat.bodyHalfW - 2;
+        const rightSafe = item.body.position.x + item.spec.width * 0.5 + this.t.cat.bodyHalfW + 2;
+        if (this.cat.x > leftSafe && this.cat.x < rightSafe) {
+          const distLeft = Math.abs(this.cat.x - leftSafe);
+          const distRight = Math.abs(rightSafe - this.cat.x);
+          this.cat.x = clamp(
+            distRight <= distLeft && rightSafe <= this.t.cat.maxX ? rightSafe : leftSafe,
+            this.t.cat.minX,
+            this.t.cat.maxX,
+          );
+        }
+      }
+    }
+
+    // 接触物品推力逻辑（仅在地面向右主动推或轻拍时施力）
     const pawX = this.cat.x + this.cat.facing * this.t.cat.pawReach;
-    if (moveDir > 0 || canTap) {
+    if (!jumpRes.isAirborne && (moveDir > 0 || canTap)) {
       for (const item of this.items) {
         if (item.dropped) continue;
         const b = item.body;
@@ -274,6 +398,7 @@ export class CatPushWorld {
         }
 
         if (canTap) {
+          item.tapCoastSec = 0.26;
           const tapSpeed = item.spec.heavy
             ? clamp(item.spec.maxNudgeSpeed * 2.2 + 0.55, 0.85, 2.0)
             : clamp(
@@ -324,12 +449,41 @@ export class CatPushWorld {
     const droppedItems: DroppedNotice[] = [];
     let hasMovingItem = false;
     let hasTeeteringItem = false;
+    let teeteringItemLabel: string | null = null;
+    const snapshots: DisplacedItemSnapshot[] = [];
 
     for (const item of this.items) {
+      item.restoreGraceSec = Math.max(0, item.restoreGraceSec - dtSec);
+      item.tapCoastSec = Math.max(0, item.tapCoastSec - dtSec);
       const b = item.body;
+
+      // 除自滚/震动背刺物品 (pen / lipstick / phone) 外，普通物品在玩家松手后迅速刹车防余滑冤死
+      const isSelfMovingKind =
+        item.kind === 'pen' || item.kind === 'lipstick' || item.kind === 'phone';
+      if (
+        !item.dropped &&
+        !isSelfMovingKind &&
+        moveDir === 0 &&
+        !canTap &&
+        item.tapCoastSec <= 0 &&
+        item.multiplier === 1 &&
+        b.position.y <= this.t.scene.tableTopY + 12
+      ) {
+        const nextVx = b.velocity.x * 0.55;
+        const nextAngVel = b.angularVelocity * 0.55;
+        if (Math.hypot(nextVx, b.velocity.y) < 0.45 && Math.abs(nextAngVel) < 0.05) {
+          Matter.Body.setVelocity(b, { x: 0, y: 0 });
+          Matter.Body.setAngularVelocity(b, 0);
+        } else {
+          Matter.Body.setVelocity(b, { x: nextVx, y: b.velocity.y });
+          Matter.Body.setAngularVelocity(b, nextAngVel);
+        }
+      }
+
       const speed = Math.hypot(b.velocity.x, b.velocity.y);
       if (
         !item.dropped &&
+        item.restoreGraceSec <= 0 &&
         (speed > this.t.steward.motionSpeedThreshold || Math.abs(b.angularVelocity) > 0.04)
       ) {
         hasMovingItem = true;
@@ -350,6 +504,16 @@ export class CatPushWorld {
         item.multiplier = teeter.multiplier;
         if (item.multiplier >= 2) {
           hasTeeteringItem = true;
+          if (!teeteringItemLabel) teeteringItemLabel = item.spec.label;
+        }
+        if (b.position.y <= this.t.scene.tableTopY + 12) {
+          snapshots.push({
+            id: item.id,
+            label: item.spec.label,
+            x: b.position.x,
+            originX: item.originX,
+            multiplier: item.multiplier,
+          });
         }
 
         // 高重心易碎物在桌面上提前倾倒碎裂（只拿一半折损分）
@@ -400,12 +564,18 @@ export class CatPushWorld {
     }
 
     const waveCleared = this.items.length > 0 && this.items.every((it) => it.dropped);
+    const filteredSnapshots = excludeRestoreIds
+      ? snapshots.filter((s) => !excludeRestoreIds.has(s.id))
+      : snapshots;
+    const restoreCandidate = pickRestoreTarget(filteredSnapshots, this.t, difficulty);
 
     return {
       droppedItems,
       addedNoise,
       hasMovingItem,
       hasTeeteringItem,
+      teeteringItemLabel,
+      restoreCandidate,
       waveCleared,
       phoneBuzzed,
     };

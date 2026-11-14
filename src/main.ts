@@ -1,8 +1,9 @@
 import './style.css';
 import { STAGES, STAGE_IDS, type GameMode, type StageId } from './config/stages';
-import { tuning, type ItemKind } from './config/tuning';
+import { tuning, type DifficultyMode, type ItemKind } from './config/tuning';
 import { SoundEngine } from './game/audio';
 import {
+  applyEndlessResult,
   applyStageResult,
   createBillSummary,
   createInitialProgress,
@@ -10,14 +11,35 @@ import {
   evaluateStageStars,
   recordItemDrop,
   stepSteward,
+  triggerMeowCharm,
   type BillSummary,
+  type DifficultyProgress,
   type StageProgress,
   type StewardState,
 } from './game/rules';
 import { CatPushWorld } from './game/world';
 import { drawGameFrame, type FloatingText, type Particle } from './render/painter';
 
-const PROGRESS_KEY = 'cat_push_progress_v2';
+const PROGRESS_KEY = 'cat_push_progress_v3';
+
+function sanitizeDifficultyProgress(
+  raw: Partial<DifficultyProgress> | undefined,
+  fallback: DifficultyProgress,
+): DifficultyProgress {
+  if (!raw) return fallback;
+  return {
+    unlockedStage:
+      raw.unlockedStage && raw.unlockedStage >= 1 && raw.unlockedStage <= 4
+        ? raw.unlockedStage
+        : fallback.unlockedStage,
+    stars: { ...fallback.stars, ...(raw.stars ?? {}) },
+    bestScores: { ...fallback.bestScores, ...(raw.bestScores ?? {}) },
+    endlessBestScore:
+      typeof raw.endlessBestScore === 'number' && raw.endlessBestScore > 0
+        ? raw.endlessBestScore
+        : 0,
+  };
+}
 
 function readProgress(): StageProgress {
   try {
@@ -26,16 +48,11 @@ function readProgress(): StageProgress {
     const parsed = JSON.parse(raw) as Partial<StageProgress>;
     const base = createInitialProgress();
     return {
-      unlockedStage:
-        parsed.unlockedStage && parsed.unlockedStage >= 1 && parsed.unlockedStage <= 4
-          ? parsed.unlockedStage
-          : base.unlockedStage,
-      stars: { ...base.stars, ...(parsed.stars ?? {}) },
-      bestScores: { ...base.bestScores, ...(parsed.bestScores ?? {}) },
-      endlessBestScore:
-        typeof parsed.endlessBestScore === 'number' && parsed.endlessBestScore > 0
-          ? parsed.endlessBestScore
-          : 0,
+      byDifficulty: {
+        easy: sanitizeDifficultyProgress(parsed.byDifficulty?.easy, base.byDifficulty.easy),
+        normal: sanitizeDifficultyProgress(parsed.byDifficulty?.normal, base.byDifficulty.normal),
+        hard: sanitizeDifficultyProgress(parsed.byDifficulty?.hard, base.byDifficulty.hard),
+      },
     };
   } catch {
     return createInitialProgress();
@@ -103,12 +120,14 @@ function main(): void {
   const sound = new SoundEngine();
   let progress = readProgress();
   let gameMode: GameMode = 'story';
+  let difficulty: DifficultyMode = 'easy';
   let stageId: StageId = 1;
   let world = new CatPushWorld(tuning, STAGES[stageId].items);
-  let steward: StewardState = createStewardState(tuning);
+  let steward: StewardState = createStewardState(tuning, difficulty);
   let bill: BillSummary = createBillSummary();
   let screenMode: 'title' | 'playing' | 'result' = 'title';
   let waveNumber = 1;
+  const restoredThisWatch = new Set<number>();
 
   const particles: Particle[] = [];
   const floats: FloatingText[] = [];
@@ -118,8 +137,11 @@ function main(): void {
   let movePointerActive = false;
   let movePointerId: number | null = null;
   let movePointerSide: -1 | 0 | 1 = 0;
+  let movePointerStartY = 0;
   const heldKeys = new Set<string>();
   let tapQueued = false;
+  let jumpQueued = false;
+  let meowQueued = false;
 
   let dpr = 1;
 
@@ -171,8 +193,9 @@ function main(): void {
     world = new CatPushWorld(tuning, items);
     waveNumber = 1;
     world.spawnWave(waveNumber, items);
-    steward = createStewardState(tuning);
+    steward = createStewardState(tuning, difficulty);
     bill = createBillSummary();
+    restoredThisWatch.clear();
     particles.length = 0;
     floats.length = 0;
     shakeMag = 0;
@@ -188,9 +211,9 @@ function main(): void {
       const target = STAGES[stageId].targetScore;
       const stars =
         endReason === 'hearts_zero' ? 0 : evaluateStageStars(bill.totalScore, target, steward.hearts);
-      progress = applyStageResult(progress, stageId, bill.totalScore, stars);
-    } else if (bill.totalScore > progress.endlessBestScore) {
-      progress = { ...progress, endlessBestScore: Math.floor(bill.totalScore) };
+      progress = applyStageResult(progress, difficulty, stageId, bill.totalScore, stars);
+    } else {
+      progress = applyEndlessResult(progress, difficulty, bill.totalScore);
     }
     writeProgress(progress);
   }
@@ -279,8 +302,8 @@ function main(): void {
     const pt = toLogicalCoords(e.clientX, e.clientY);
 
     if (screenMode === 'title') {
-      // 双模式切换
-      if (pt.y >= 168 && pt.y <= 200) {
+      // 双模式切换 (y: 144..174)
+      if (pt.y >= 144 && pt.y <= 174) {
         if (pt.x >= 40 && pt.x <= 190) {
           gameMode = 'story';
           return;
@@ -290,18 +313,33 @@ function main(): void {
           return;
         }
       }
-      // 4 关选关
-      if (gameMode === 'story' && pt.y >= 214 && pt.y <= 276) {
+      // 3 档难度切换 (y: 184..212)
+      if (pt.y >= 184 && pt.y <= 212) {
+        let nextDiff: DifficultyMode | null = null;
+        if (pt.x >= 40 && pt.x <= 140) nextDiff = 'easy';
+        else if (pt.x >= 145 && pt.x <= 245) nextDiff = 'normal';
+        else if (pt.x >= 250 && pt.x <= 350) nextDiff = 'hard';
+        if (nextDiff) {
+          difficulty = nextDiff;
+          if (stageId > progress.byDifficulty[difficulty].unlockedStage) {
+            stageId = progress.byDifficulty[difficulty].unlockedStage;
+          }
+          return;
+        }
+      }
+      // 4 关选关 (y: 242..302)
+      if (gameMode === 'story' && pt.y >= 242 && pt.y <= 302) {
+        const unlockedStage = progress.byDifficulty[difficulty].unlockedStage;
         STAGE_IDS.forEach((id, idx) => {
           const sx = 34 + idx * 82;
-          if (pt.x >= sx && pt.x <= sx + 76 && id <= progress.unlockedStage) {
+          if (pt.x >= sx && pt.x <= sx + 76 && id <= unlockedStage) {
             stageId = id;
           }
         });
         return;
       }
-      // 开始按钮
-      if (pt.x >= 64 && pt.x <= tuning.view.width - 64 && pt.y >= 416 && pt.y <= 468) {
+      // 开始按钮 (y: 444..496)
+      if (pt.x >= 64 && pt.x <= tuning.view.width - 64 && pt.y >= 444 && pt.y <= 496) {
         startNewGame(stageId);
       }
       return;
@@ -328,17 +366,26 @@ function main(): void {
       return;
     }
 
-    // 右下角「轻拍! (Space)」独立多指触控按钮
-    const tapBtn = tuning.buttons.tap;
+    // 右下角 3 个独立多指触控技能钮：轻拍! / 跳 / 喵~
+    const { tap: tapBtn, jump: jumpBtn, meow: meowBtn } = tuning.buttons;
     if (Math.hypot(pt.x - tapBtn.x, pt.y - tapBtn.y) <= tapBtn.r + 6) {
       tapQueued = true;
       return;
     }
+    if (Math.hypot(pt.x - jumpBtn.x, pt.y - jumpBtn.y) <= jumpBtn.r + 6) {
+      jumpQueued = true;
+      return;
+    }
+    if (Math.hypot(pt.x - meowBtn.x, pt.y - meowBtn.y) <= meowBtn.r + 6) {
+      meowQueued = true;
+      return;
+    }
 
-    // 左右半区按住移动（不与轻拍按钮抢指针）
+    // 左右半区按住移动（不与技能按钮抢指针；向上轻划触发跳跃）
     movePointerActive = true;
     movePointerId = e.pointerId;
     movePointerSide = pt.x < tuning.view.width / 2 ? -1 : 1;
+    movePointerStartY = pt.y;
     try {
       canvas.setPointerCapture(e.pointerId);
     } catch {
@@ -351,6 +398,10 @@ function main(): void {
     if (movePointerId !== null && e.pointerId !== movePointerId) return;
     const pt = toLogicalCoords(e.clientX, e.clientY);
     movePointerSide = pt.x < tuning.view.width / 2 ? -1 : 1;
+    if (movePointerStartY - pt.y >= 42) {
+      jumpQueued = true;
+      movePointerStartY = pt.y;
+    }
   }
 
   function onPointerUpOrCancel(e: PointerEvent): void {
@@ -361,7 +412,7 @@ function main(): void {
   }
 
   function onKeyDown(e: KeyboardEvent): void {
-    if (['ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) {
+    if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'Space'].includes(e.code)) {
       e.preventDefault();
     }
 
@@ -380,6 +431,10 @@ function main(): void {
     sound.unlock();
     if (e.code === 'Space' && !e.repeat) {
       tapQueued = true;
+    } else if ((e.code === 'KeyW' || e.code === 'ArrowUp') && !e.repeat) {
+      jumpQueued = true;
+    } else if (e.code === 'KeyE' && !e.repeat) {
+      meowQueued = true;
     } else if (
       e.code === 'KeyA' ||
       e.code === 'ArrowLeft' ||
@@ -436,12 +491,38 @@ function main(): void {
 
     const moveDir = computeMoveDir();
     const didTap = tapQueued;
+    const didJump = jumpQueued && world.cat.jumpTimerSec <= 0;
+    const didMeow = meowQueued;
     tapQueued = false;
+    jumpQueued = false;
+    meowQueued = false;
+
     if (didTap) {
       sound.playTapPaw();
     }
+    if (didJump) {
+      sound.playJump();
+    }
+    if (didMeow) {
+      const charmRes = triggerMeowCharm(steward, tuning);
+      if (charmRes.triggered) {
+        steward = charmRes.state;
+        world.cat.meowBubbleSec = 1.25;
+        sound.playMeow();
+        if (charmRes.interruptedSteward) {
+          floats.push({
+            x: world.cat.x,
+            y: tuning.scene.tableTopY - 72,
+            text: '卖萌打断成功!',
+            color: '#ec4899',
+            life: 1.0,
+            maxLife: 1.0,
+          });
+        }
+      }
+    }
 
-    const worldRes = world.step(moveDir, didTap, dtMs);
+    const worldRes = world.step(moveDir, didTap, didJump, dtMs, difficulty, restoredThisWatch);
     if (worldRes.phoneBuzzed) {
       sound.playPhoneBuzz();
     }
@@ -482,10 +563,31 @@ function main(): void {
         itemDroppedDuringStep: worldRes.droppedItems.length > 0,
         addedNoise: worldRes.addedNoise,
         hasTeeteringItem: worldRes.hasTeeteringItem,
+        teeteringItemLabel: worldRes.teeteringItemLabel,
+        restoreCandidate: worldRes.restoreCandidate,
         enableTeeterSuspicion,
       },
       tuning,
     );
+
+    if (steward.phase !== 'WATCHING') {
+      restoredThisWatch.clear();
+    }
+
+    if (steward.lastRestoredId !== null) {
+      restoredThisWatch.add(steward.lastRestoredId);
+      const restored = world.restoreItemById(steward.lastRestoredId, difficulty);
+      if (restored) {
+        floats.push({
+          x: restored.body.position.x,
+          y: tuning.scene.tableTopY - restored.spec.height - 16,
+          text: `${restored.spec.label}被摆回原位!`,
+          color: '#f59e0b',
+          life: 1.1,
+          maxLife: 1.1,
+        });
+      }
+    }
 
     if (prevPhase !== 'WARNING' && steward.phase === 'WARNING') {
       sound.playWarningTick();
@@ -521,6 +623,7 @@ function main(): void {
       {
         screenMode,
         gameMode,
+        difficulty,
         stageId,
         progress,
         steward,

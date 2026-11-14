@@ -15,6 +15,22 @@ export type ItemKind =
   | 'wineglass'
   | 'fishbowl';
 
+export type DifficultyMode = 'easy' | 'normal' | 'hard';
+
+export interface DifficultyConfig {
+  readonly id: DifficultyMode;
+  readonly label: string;
+  readonly subtitle: string;
+  readonly minRelaxedSec: number;
+  readonly warningDurationSec: number;
+  readonly teeterWatchBonusSec: number;
+  readonly maxRestoresPerWatch: number;
+  readonly restoreDisplacementPx: number;
+  readonly restorePullRatio: number;
+  readonly meowResistantAfterUses: number | null;
+  readonly meowResistantDurationSec: number;
+}
+
 export interface ItemSpec {
   readonly kind: ItemKind;
   readonly label: string;
@@ -69,9 +85,15 @@ export const tuning = {
     tapCooldownSec: 0.35,
     tapImpulseSpeedBoost: 84,
     tapNoiseSpike: 24,
+    jumpDurationSec: 0.42,
+    jumpHeightPx: 54,
+    meowCooldownSec: 9.0,
+    meowCharmDurationSec: 1.8,
   },
   buttons: {
-    tap: { x: 332, y: 566, r: 34 },
+    tap: { x: 344, y: 566, r: 28 },
+    jump: { x: 280, y: 572, r: 24 },
+    meow: { x: 220, y: 572, r: 24 },
   },
   teeter: {
     /** 质心距离桌沿在此范围内且倾角大于 minTiltDeg 即触发悬边 */
@@ -95,7 +117,51 @@ export const tuning = {
     distractMinCooldownSec: 14,
     distractMaxCooldownSec: 18,
     distractDurationSec: 2.6,
+    restoreDisplacementPx: 42,
+    restoreDurationSec: 0.95,
+    restorePullRatio: 0.4,
   },
+  difficulties: {
+    easy: {
+      id: 'easy',
+      label: '简单',
+      subtitle: '新手推荐 · 轻松爽推',
+      minRelaxedSec: 2.6,
+      warningDurationSec: 1.05,
+      teeterWatchBonusSec: 0.45,
+      maxRestoresPerWatch: 0,
+      restoreDisplacementPx: 999,
+      restorePullRatio: 0,
+      meowResistantAfterUses: null,
+      meowResistantDurationSec: 1.8,
+    },
+    normal: {
+      id: 'normal',
+      label: '中级',
+      subtitle: '每次拉回1件 · 策略博弈',
+      minRelaxedSec: 2.6,
+      warningDurationSec: 0.9,
+      teeterWatchBonusSec: 0.6,
+      maxRestoresPerWatch: 1,
+      restoreDisplacementPx: 42,
+      restorePullRatio: 0.4,
+      meowResistantAfterUses: null,
+      meowResistantDurationSec: 1.8,
+    },
+    hard: {
+      id: 'hard',
+      label: '高级',
+      subtitle: '连拉2件 + 卖萌抗性 · 硬核',
+      minRelaxedSec: 2.1,
+      warningDurationSec: 0.78,
+      teeterWatchBonusSec: 0.8,
+      maxRestoresPerWatch: 2,
+      restoreDisplacementPx: 28,
+      restorePullRatio: 0.6,
+      meowResistantAfterUses: 3,
+      meowResistantDurationSec: 1.0,
+    },
+  } as Record<DifficultyMode, DifficultyConfig>,
   items: {
     tissue: {
       kind: 'tissue',
