@@ -1,33 +1,50 @@
 import './style.css';
+import { STAGES, STAGE_IDS, type GameMode, type StageId } from './config/stages';
 import { tuning, type ItemKind } from './config/tuning';
 import { SoundEngine } from './game/audio';
 import {
+  applyStageResult,
   createBillSummary,
+  createInitialProgress,
   createStewardState,
+  evaluateStageStars,
   recordItemDrop,
   stepSteward,
   type BillSummary,
+  type StageProgress,
   type StewardState,
 } from './game/rules';
 import { CatPushWorld } from './game/world';
 import { drawGameFrame, type FloatingText, type Particle } from './render/painter';
 
-const BEST_SCORE_KEY = 'cat_push_best_score_v1';
+const PROGRESS_KEY = 'cat_push_progress_v2';
 
-function readBestScore(): number {
+function readProgress(): StageProgress {
   try {
-    const raw = window.localStorage.getItem(BEST_SCORE_KEY);
-    if (!raw) return 0;
-    const parsed = Number.parseInt(raw, 10);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+    const raw = window.localStorage.getItem(PROGRESS_KEY);
+    if (!raw) return createInitialProgress();
+    const parsed = JSON.parse(raw) as Partial<StageProgress>;
+    const base = createInitialProgress();
+    return {
+      unlockedStage:
+        parsed.unlockedStage && parsed.unlockedStage >= 1 && parsed.unlockedStage <= 4
+          ? parsed.unlockedStage
+          : base.unlockedStage,
+      stars: { ...base.stars, ...(parsed.stars ?? {}) },
+      bestScores: { ...base.bestScores, ...(parsed.bestScores ?? {}) },
+      endlessBestScore:
+        typeof parsed.endlessBestScore === 'number' && parsed.endlessBestScore > 0
+          ? parsed.endlessBestScore
+          : 0,
+    };
   } catch {
-    return 0;
+    return createInitialProgress();
   }
 }
 
-function writeBestScore(score: number): void {
+function writeProgress(progress: StageProgress): void {
   try {
-    window.localStorage.setItem(BEST_SCORE_KEY, String(Math.max(0, Math.floor(score))));
+    window.localStorage.setItem(PROGRESS_KEY, JSON.stringify(progress));
   } catch {
     // Ignore storage failures in restricted contexts
   }
@@ -38,11 +55,33 @@ function itemColor(kind: ItemKind): string {
     case 'tissue':
       return '#f8fafc';
     case 'pen':
-      return '#ef4444';
+      return '#339af0';
     case 'mug':
-      return '#93c5fd';
+      return '#f2a679';
     case 'kettle':
       return '#cbd5e1';
+    case 'mouse':
+      return '#e2e8f0';
+    case 'ink':
+      return '#0f172a';
+    case 'phone':
+      return '#22c55e';
+    case 'keyboard':
+      return '#475569';
+    case 'lipstick':
+      return '#e11d48';
+    case 'compact':
+      return '#f472b6';
+    case 'perfume':
+      return '#fde047';
+    case 'mirror':
+      return '#bae6fd';
+    case 'remote':
+      return '#374151';
+    case 'wineglass':
+      return '#be123c';
+    case 'fishbowl':
+      return '#38bdf8';
   }
 }
 
@@ -62,10 +101,12 @@ function main(): void {
   const debugMode = params.get('debug') === '1';
 
   const sound = new SoundEngine();
-  let world = new CatPushWorld(tuning);
+  let progress = readProgress();
+  let gameMode: GameMode = 'story';
+  let stageId: StageId = 1;
+  let world = new CatPushWorld(tuning, STAGES[stageId].items);
   let steward: StewardState = createStewardState(tuning);
   let bill: BillSummary = createBillSummary();
-  let bestScore = readBestScore();
   let screenMode: 'title' | 'playing' | 'result' = 'title';
   let waveNumber = 1;
 
@@ -74,9 +115,9 @@ function main(): void {
   let shakeMag = 0;
   let animTimeSec = 0;
 
-  let pointerActive = false;
-  let pointerId: number | null = null;
-  let pointerSide: -1 | 0 | 1 = 0;
+  let movePointerActive = false;
+  let movePointerId: number | null = null;
+  let movePointerSide: -1 | 0 | 1 = 0;
   const heldKeys = new Set<string>();
   let tapQueued = false;
 
@@ -112,18 +153,24 @@ function main(): void {
   }
 
   function clearInputs(): void {
-    pointerActive = false;
-    pointerId = null;
-    pointerSide = 0;
+    movePointerActive = false;
+    movePointerId = null;
+    movePointerSide = 0;
     heldKeys.clear();
     tapQueued = false;
   }
 
-  function startNewGame(): void {
+  function activeStageItems(): readonly ItemKind[] {
+    return gameMode === 'story' ? STAGES[stageId].items : STAGES[1].items;
+  }
+
+  function startNewGame(nextStageId: StageId = stageId): void {
     sound.unlock();
-    world = new CatPushWorld(tuning);
+    stageId = nextStageId;
+    const items = activeStageItems();
+    world = new CatPushWorld(tuning, items);
     waveNumber = 1;
-    world.spawnWave(waveNumber);
+    world.spawnWave(waveNumber, items);
     steward = createStewardState(tuning);
     bill = createBillSummary();
     particles.length = 0;
@@ -133,38 +180,85 @@ function main(): void {
     screenMode = 'playing';
   }
 
-  function spawnDropEffects(x: number, kind: ItemKind, totalScore: number, multiplier: 1 | 2 | 3): void {
-    const y = tuning.scene.floorY - 10;
-    const count = kind === 'kettle' ? 18 : kind === 'mug' ? 14 : 9;
+  function finishMatch(endReason: StewardState['endReason']): void {
+    steward = { ...steward, finished: true, endReason };
+    screenMode = 'result';
+    clearInputs();
+    if (gameMode === 'story') {
+      const target = STAGES[stageId].targetScore;
+      const stars =
+        endReason === 'hearts_zero' ? 0 : evaluateStageStars(bill.totalScore, target, steward.hearts);
+      progress = applyStageResult(progress, stageId, bill.totalScore, stars);
+    } else if (bill.totalScore > progress.endlessBestScore) {
+      progress = { ...progress, endlessBestScore: Math.floor(bill.totalScore) };
+    }
+    writeProgress(progress);
+  }
+
+  function spawnDropEffects(
+    x: number,
+    y: number,
+    kind: ItemKind,
+    score: number,
+    multiplier: 1 | 2 | 3,
+    brokeOnTable: boolean,
+  ): void {
+    const count =
+      kind === 'fishbowl'
+        ? 26
+        : kind === 'ink' || kind === 'compact'
+          ? 20
+          : tuning.items[kind].heavy
+            ? 18
+            : 10;
     const baseColor = itemColor(kind);
 
     for (let i = 0; i < count; i++) {
       const angle = -Math.PI + Math.random() * Math.PI;
-      const speed = 70 + Math.random() * 190;
+      const speed = 70 + Math.random() * 200;
+      const isGoldfish = kind === 'fishbowl' && i < 3;
       particles.push({
-        x: x + (Math.random() - 0.5) * 18,
+        x: x + (Math.random() - 0.5) * 20,
         y,
         vx: Math.cos(angle) * speed,
-        vy: Math.sin(angle) * speed - 40,
-        r: 2.5 + Math.random() * 3.5,
-        color: i % 3 === 0 ? '#fde68a' : baseColor,
-        life: 0.55 + Math.random() * 0.25,
-        maxLife: 0.8,
+        vy: Math.sin(angle) * speed - (isGoldfish ? 110 : 40),
+        r: isGoldfish ? 5 : 2.5 + Math.random() * 3.5,
+        color: isGoldfish ? '#f97316' : i % 3 === 0 ? '#fde68a' : baseColor,
+        life: 0.6 + Math.random() * 0.3,
+        maxLife: 0.9,
       });
     }
 
-    const multLabel = multiplier > 1 ? ` ×${multiplier}!` : '';
+    const prefix = brokeOnTable ? '提前摔碎 +¥' : '+¥';
+    const multLabel = !brokeOnTable && multiplier > 1 ? ` ×${multiplier}!` : '';
     floats.push({
-      x: Math.max(46, Math.min(tuning.view.width - 46, x)),
+      x: Math.max(54, Math.min(tuning.view.width - 54, x)),
       y: y - 16,
-      text: `+¥${totalScore}${multLabel}`,
-      color: multiplier === 3 ? '#dc2626' : multiplier === 2 ? '#ea580c' : '#15803d',
-      life: 1.05,
-      maxLife: 1.05,
+      text: `${prefix}${score}${multLabel}`,
+      color: brokeOnTable
+        ? '#f97316'
+        : multiplier === 3
+          ? '#dc2626'
+          : multiplier === 2
+            ? '#ea580c'
+            : '#15803d',
+      life: 1.1,
+      maxLife: 1.1,
     });
 
-    if (kind === 'kettle' || kind === 'mug' || multiplier >= 2) {
-      shakeMag = Math.max(shakeMag, kind === 'kettle' ? 9 : 5.5);
+    if (kind === 'fishbowl') {
+      floats.push({
+        x: Math.max(54, Math.min(tuning.view.width - 54, x)),
+        y: y - 38,
+        text: '🐟 小金鱼逃生!',
+        color: '#0284c7',
+        life: 1.2,
+        maxLife: 1.2,
+      });
+    }
+
+    if (tuning.items[kind].heavy || multiplier >= 2) {
+      shakeMag = Math.max(shakeMag, kind === 'fishbowl' || kind === 'kettle' ? 9 : 5.5);
     }
   }
 
@@ -172,8 +266,8 @@ function main(): void {
     let dir = 0;
     if (heldKeys.has('KeyA') || heldKeys.has('ArrowLeft')) dir -= 1;
     if (heldKeys.has('KeyD') || heldKeys.has('ArrowRight')) dir += 1;
-    if (dir === 0 && pointerActive) {
-      dir = pointerSide;
+    if (dir === 0 && movePointerActive) {
+      dir = movePointerSide;
     }
     if (dir < 0) return -1;
     if (dir > 0) return 1;
@@ -185,48 +279,85 @@ function main(): void {
     const pt = toLogicalCoords(e.clientX, e.clientY);
 
     if (screenMode === 'title') {
-      if (pt.x >= 64 && pt.x <= tuning.view.width - 64 && pt.y >= 408 && pt.y <= 458) {
-        startNewGame();
+      // 双模式切换
+      if (pt.y >= 168 && pt.y <= 200) {
+        if (pt.x >= 40 && pt.x <= 190) {
+          gameMode = 'story';
+          return;
+        }
+        if (pt.x >= 200 && pt.x <= 350) {
+          gameMode = 'endless';
+          return;
+        }
+      }
+      // 4 关选关
+      if (gameMode === 'story' && pt.y >= 214 && pt.y <= 276) {
+        STAGE_IDS.forEach((id, idx) => {
+          const sx = 34 + idx * 82;
+          if (pt.x >= sx && pt.x <= sx + 76 && id <= progress.unlockedStage) {
+            stageId = id;
+          }
+        });
+        return;
+      }
+      // 开始按钮
+      if (pt.x >= 64 && pt.x <= tuning.view.width - 64 && pt.y >= 416 && pt.y <= 468) {
+        startNewGame(stageId);
       }
       return;
     }
 
     if (screenMode === 'result') {
-      if (pt.x >= 64 && pt.x <= tuning.view.width - 64 && pt.y >= 434 && pt.y <= 486) {
-        startNewGame();
+      const passedStory =
+        gameMode === 'story' &&
+        steward.endReason !== 'hearts_zero' &&
+        bill.totalScore >= STAGES[stageId].targetScore;
+      if (passedStory && stageId < 4 && pt.x >= 64 && pt.x <= tuning.view.width - 64 && pt.y >= 404 && pt.y <= 452) {
+        startNewGame((stageId + 1) as StageId);
+        return;
+      }
+      if (pt.x >= 64 && pt.x <= tuning.view.width - 64 && pt.y >= 462 && pt.y <= 512) {
+        startNewGame(stageId);
       }
       return;
     }
 
-    // Mute button top-right
-    const muteDist = Math.hypot(pt.x - (tuning.view.width - 32), pt.y - 38);
-    if (muteDist <= 22) {
+    // 静音按钮
+    if (Math.hypot(pt.x - (tuning.view.width - 30), pt.y - 38) <= 22) {
       sound.muted = !sound.muted;
       return;
     }
 
-    pointerActive = true;
-    pointerId = e.pointerId;
-    pointerSide = pt.x < tuning.view.width / 2 ? -1 : 1;
+    // 右下角「轻拍! (Space)」独立多指触控按钮
+    const tapBtn = tuning.buttons.tap;
+    if (Math.hypot(pt.x - tapBtn.x, pt.y - tapBtn.y) <= tapBtn.r + 6) {
+      tapQueued = true;
+      return;
+    }
+
+    // 左右半区按住移动（不与轻拍按钮抢指针）
+    movePointerActive = true;
+    movePointerId = e.pointerId;
+    movePointerSide = pt.x < tuning.view.width / 2 ? -1 : 1;
     try {
       canvas.setPointerCapture(e.pointerId);
     } catch {
-      // Ignore synthetic events without active pointer capture
+      // Ignore synthetic events
     }
   }
 
   function onPointerMove(e: PointerEvent): void {
-    if (!pointerActive || screenMode !== 'playing') return;
-    if (pointerId !== null && e.pointerId !== pointerId) return;
+    if (!movePointerActive || screenMode !== 'playing') return;
+    if (movePointerId !== null && e.pointerId !== movePointerId) return;
     const pt = toLogicalCoords(e.clientX, e.clientY);
-    pointerSide = pt.x < tuning.view.width / 2 ? -1 : 1;
+    movePointerSide = pt.x < tuning.view.width / 2 ? -1 : 1;
   }
 
   function onPointerUpOrCancel(e: PointerEvent): void {
-    if (pointerId !== null && e.pointerId !== pointerId) return;
-    pointerActive = false;
-    pointerId = null;
-    pointerSide = 0;
+    if (movePointerId !== null && e.pointerId !== movePointerId) return;
+    movePointerActive = false;
+    movePointerId = null;
+    movePointerSide = 0;
   }
 
   function onKeyDown(e: KeyboardEvent): void {
@@ -235,12 +366,12 @@ function main(): void {
     }
 
     if (screenMode === 'title' && (e.code === 'Space' || e.code === 'Enter')) {
-      startNewGame();
+      startNewGame(stageId);
       return;
     }
 
     if (screenMode === 'result' && (e.code === 'KeyR' || e.code === 'Enter')) {
-      startNewGame();
+      startNewGame(stageId);
       return;
     }
 
@@ -283,7 +414,6 @@ function main(): void {
     const dtSec = dtMs / 1000;
     animTimeSec += dtSec;
 
-    // Update particles & floating damage numbers even on result screen
     for (let i = particles.length - 1; i >= 0; i--) {
       const p = particles[i];
       p.life -= dtSec;
@@ -312,24 +442,37 @@ function main(): void {
     }
 
     const worldRes = world.step(moveDir, didTap, dtMs);
+    if (worldRes.phoneBuzzed) {
+      sound.playPhoneBuzz();
+    }
+
     for (const drop of worldRes.droppedItems) {
-      bill = recordItemDrop(bill, drop.kind, drop.multiplier, tuning);
-      sound.playCrash(drop.kind === 'kettle' || drop.kind === 'mug');
+      bill = recordItemDrop(bill, drop.kind, drop.multiplier, tuning, drop.brokeOnTable);
+      sound.playCrash(drop.heavy);
       spawnDropEffects(
         drop.x,
+        drop.y,
         drop.kind,
-        tuning.items[drop.kind].baseScore * drop.multiplier,
+        drop.score,
         drop.multiplier,
+        drop.brokeOnTable,
       );
     }
 
     if (worldRes.waveCleared) {
+      if (gameMode === 'story' && bill.totalScore >= STAGES[stageId].targetScore) {
+        finishMatch('stage_cleared');
+        return;
+      }
       waveNumber += 1;
-      world.spawnWave(waveNumber);
+      world.spawnWave(waveNumber, activeStageItems());
     }
 
     const prevPhase = steward.phase;
     const playerActive = moveDir !== 0 || didTap;
+    const enableTeeterSuspicion =
+      gameMode === 'story' ? STAGES[stageId].enableTeeterSuspicion : waveNumber >= 2;
+
     steward = stepSteward(
       steward,
       {
@@ -338,6 +481,8 @@ function main(): void {
         hasMovingItem: worldRes.hasMovingItem,
         itemDroppedDuringStep: worldRes.droppedItems.length > 0,
         addedNoise: worldRes.addedNoise,
+        hasTeeteringItem: worldRes.hasTeeteringItem,
+        enableTeeterSuspicion,
       },
       tuning,
     );
@@ -351,12 +496,7 @@ function main(): void {
     }
 
     if (steward.finished) {
-      screenMode = 'result';
-      clearInputs();
-      if (bill.totalScore > bestScore) {
-        bestScore = bill.totalScore;
-        writeBestScore(bestScore);
-      }
+      finishMatch(steward.endReason);
     }
   }
 
@@ -380,9 +520,11 @@ function main(): void {
       world,
       {
         screenMode,
+        gameMode,
+        stageId,
+        progress,
         steward,
         bill,
-        bestScore,
         muted: sound.muted,
         debug: debugMode,
         shakeX,

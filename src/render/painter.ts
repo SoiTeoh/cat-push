@@ -1,5 +1,6 @@
+import { STAGES, STAGE_IDS, type GameMode, type StageConfig, type StageId } from '../config/stages';
 import { tuning, type Tuning } from '../config/tuning';
-import type { BillSummary, StewardState } from '../game/rules';
+import { clamp, type BillSummary, type StageProgress, type StewardState } from '../game/rules';
 import type { CatPushWorld, TableItem } from '../game/world';
 
 export interface Particle {
@@ -24,9 +25,11 @@ export interface FloatingText {
 
 export interface RenderExtra {
   readonly screenMode: 'title' | 'playing' | 'result';
+  readonly gameMode: GameMode;
+  readonly stageId: StageId;
+  readonly progress: StageProgress;
   readonly steward: StewardState;
   readonly bill: BillSummary;
-  readonly bestScore: number;
   readonly muted: boolean;
   readonly debug: boolean;
   readonly shakeX: number;
@@ -44,42 +47,43 @@ export function drawGameFrame(
 ): void {
   const { width, height } = t.view;
   const { tableTopY, tableEdgeX, tableThickness, floorY } = t.scene;
+  const stage = STAGES[extra.stageId];
 
   ctx.save();
   ctx.clearRect(0, 0, width, height);
   ctx.translate(extra.shakeX, extra.shakeY);
 
-  // 1. 温暖室内背景墙与地板
-  drawRoomBackground(ctx, width, height, tableTopY, floorY);
+  // 1. 主题房间背景与地板
+  drawRoomBackground(ctx, width, height, tableTopY, floorY, stage);
 
-  // 2. 背景监控区：低头刷手机的铲屎官
+  // 2. 背景监控区：铲屎官（含分心窗口 & 悬边怀疑气泡）
   drawSteward(ctx, extra.steward, tableTopY, extra.animTimeSec);
 
-  // 3. 白色平滑桌面 + 清晰右桌沿
-  drawTable(ctx, width, tableTopY, tableEdgeX, tableThickness, floorY);
+  // 3. 主题桌面 + 清晰右桌沿
+  drawTable(ctx, width, tableTopY, tableEdgeX, tableThickness, floorY, stage);
 
-  // 4. 桌面物品（带悬边惊恐流汗与倍率提示）
+  // 4. 桌面物品
   for (const item of world.items) {
     if (item.dropped) continue;
     drawItem(ctx, item, tableEdgeX, extra.animTimeSec);
   }
 
-  // 5. 手贱橘猫（含 3 种瞳孔表情与 0.12s 眯眼装睡）
+  // 5. 手贱橘猫（停靠物体外侧，仅前爪抵住左侧面推进）
   drawCat(ctx, world, extra.steward, tableTopY, extra.animTimeSec);
 
   // 6. 碎裂粒子与飘字
   drawParticlesAndFloats(ctx, extra.particles, extra.floats);
 
-  // 7. 局内极简 HUD（或封面 / 结算卡）
+  // 7. 局内 HUD / 封面 / 结算卡
   if (extra.screenMode === 'playing') {
-    drawPlayingHud(ctx, extra.steward, extra.bill, extra.muted, width, height);
+    drawPlayingHud(ctx, world, extra, t);
   } else if (extra.screenMode === 'title') {
-    drawTitleOverlay(ctx, width, height, extra.bestScore);
+    drawTitleOverlay(ctx, width, height, extra.gameMode, extra.stageId, extra.progress);
   } else {
-    drawResultOverlay(ctx, width, height, extra.steward, extra.bill, extra.bestScore);
+    drawResultOverlay(ctx, width, height, extra);
   }
 
-  // 8. ?debug=1 调试视图（刚体轮廓、质心偏移、倾角、状态机倒计时）
+  // 8. ?debug=1 调试视图
   if (extra.debug) {
     drawDebugOverlay(ctx, world, extra.steward, tableEdgeX, height);
   }
@@ -93,32 +97,39 @@ function drawRoomBackground(
   height: number,
   tableTopY: number,
   floorY: number,
+  stage: StageConfig,
 ): void {
+  const { palette } = stage;
   const wallGrad = ctx.createLinearGradient(0, 0, 0, floorY);
-  wallGrad.addColorStop(0, '#f7efe3');
-  wallGrad.addColorStop(1, '#eadbc8');
+  wallGrad.addColorStop(0, palette.wallTop);
+  wallGrad.addColorStop(1, palette.wallBottom);
   ctx.fillStyle = wallGrad;
   ctx.fillRect(-16, -16, width + 32, floorY + 16);
 
-  // 墙面暖色挂画装饰
-  ctx.fillStyle = '#dfcbb2';
+  // 墙面装饰（按关卡区分）
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.08)';
   ctx.fillRect(28, 128, 76, 56);
-  ctx.fillStyle = '#fbf5ec';
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.65)';
   ctx.fillRect(34, 134, 64, 44);
-  ctx.fillStyle = '#e89d58';
+  ctx.fillStyle = palette.accent;
   ctx.beginPath();
-  ctx.arc(66, 156, 12, 0, Math.PI * 2);
+  ctx.arc(66, 156, 11, 0, Math.PI * 2);
   ctx.fill();
 
   // 踢脚线与地板区
-  ctx.fillStyle = '#d3bea4';
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.12)';
   ctx.fillRect(0, floorY - 10, width, 10);
-  ctx.fillStyle = '#8b6a4e';
+  ctx.fillStyle = palette.floor;
   ctx.fillRect(-16, floorY, width + 32, height - floorY + 16);
 
   // 桌沿右侧深渊轻微警示阴影
-  ctx.fillStyle = 'rgba(72, 46, 26, 0.08)';
-  ctx.fillRect(tuning.scene.tableEdgeX, tableTopY, width - tuning.scene.tableEdgeX, floorY - tableTopY);
+  ctx.fillStyle = 'rgba(30, 20, 15, 0.1)';
+  ctx.fillRect(
+    tuning.scene.tableEdgeX,
+    tableTopY,
+    width - tuning.scene.tableEdgeX,
+    floorY - tableTopY,
+  );
 }
 
 function drawSteward(
@@ -130,14 +141,13 @@ function drawSteward(
   const cx = 216;
   const shoulderY = tableTopY - 62;
   const headY = shoulderY - 32;
+  const isDistracted = steward.phase === 'RELAXED' && steward.distractTimerSec > 0;
 
   ctx.save();
-  // WARNING 时肩膀微抖
   const jitter =
     steward.phase === 'WARNING' ? Math.sin(animTimeSec * 28) * 2.2 : 0;
   ctx.translate(cx + jitter, 0);
 
-  // WATCHING 红色视线扫射光束
   if (steward.phase === 'WATCHING' || steward.phase === 'CAUGHT') {
     const grad = ctx.createLinearGradient(0, headY, -60, tableTopY + 10);
     grad.addColorStop(0, 'rgba(229, 62, 62, 0.34)');
@@ -152,7 +162,8 @@ function drawSteward(
   }
 
   // 身体（卫衣）
-  ctx.fillStyle = steward.phase === 'CAUGHT' ? '#c94a3d' : '#4a647a';
+  ctx.fillStyle =
+    steward.phase === 'CAUGHT' ? '#c94a3d' : isDistracted ? '#2f855a' : '#4a647a';
   ctx.beginPath();
   ctx.roundRect(-34, shoulderY, 68, 72, [22, 22, 0, 0]);
   ctx.fill();
@@ -164,7 +175,6 @@ function drawSteward(
   ctx.fill();
 
   if (steward.phase === 'RELAXED' || steward.phase === 'WARNING') {
-    // 背对低头刷手机：后脑勺黑发 + 微弱手机光
     ctx.fillStyle = '#2d2622';
     ctx.beginPath();
     ctx.arc(0, headY - 2, 22.5, Math.PI * 0.9, Math.PI * 2.1);
@@ -173,17 +183,16 @@ function drawSteward(
     ctx.arc(0, headY + 3, 21, 0, Math.PI * 2);
     ctx.fill();
 
-    // 手机屏幕蓝光
-    ctx.fillStyle = 'rgba(130, 215, 255, 0.35)';
+    ctx.fillStyle = isDistracted
+      ? 'rgba(110, 231, 183, 0.65)'
+      : 'rgba(130, 215, 255, 0.35)';
     ctx.fillRect(-11, shoulderY + 14, 22, 12);
   } else {
-    // WATCHING / CAUGHT：转头正脸紧盯桌面
     ctx.fillStyle = '#2d2622';
     ctx.beginPath();
     ctx.arc(0, headY - 5, 22.5, Math.PI, Math.PI * 2);
     ctx.fill();
 
-    // 眼睛盯着左下方的猫
     ctx.fillStyle = '#ffffff';
     ctx.beginPath();
     ctx.ellipse(-7, headY + 1, 5, 4, 0, 0, Math.PI * 2);
@@ -196,7 +205,6 @@ function drawSteward(
     ctx.arc(5.5, headY + 2, 2.3, 0, Math.PI * 2);
     ctx.fill();
 
-    // 皱眉 / 怒嘴
     ctx.strokeStyle = '#2d2622';
     ctx.lineWidth = 2.2;
     ctx.beginPath();
@@ -214,13 +222,37 @@ function drawSteward(
     }
   }
 
-  // 头顶状态提示气泡
-  if (steward.phase === 'WARNING') {
+  // 头顶状态气泡
+  if (isDistracted) {
+    drawSpeechBubble(
+      ctx,
+      0,
+      headY - 40,
+      `📱 回消息中 ${steward.distractTimerSec.toFixed(1)}s`,
+      '#ecfdf5',
+      '#10b981',
+      '#047857',
+      118,
+    );
+  } else if (steward.phase === 'WARNING') {
     drawBadge(ctx, 0, headY - 38, '?', '#ffd166', '#2b2118');
   } else if (steward.phase === 'WATCHING') {
-    drawBadge(ctx, 0, headY - 38, '盯!', '#ef476f', '#ffffff');
+    if (steward.suspiciousTeeter) {
+      drawSpeechBubble(
+        ctx,
+        0,
+        headY - 40,
+        '嗯？杯子怎么歪了…',
+        '#fffbeb',
+        '#f59e0b',
+        '#b45309',
+        126,
+      );
+    } else {
+      drawBadge(ctx, 0, headY - 38, '盯!', '#ef476f', '#ffffff');
+    }
   } else if (steward.phase === 'CAUGHT') {
-    drawSpeechBubble(ctx, 0, headY - 40, '你在干嘛！');
+    drawSpeechBubble(ctx, 0, headY - 40, '你在干嘛！', '#fff5f5', '#d63031', '#c02626', 92);
   }
 
   ctx.restore();
@@ -252,17 +284,21 @@ function drawSpeechBubble(
   x: number,
   y: number,
   text: string,
+  bg: string,
+  border: string,
+  fg: string,
+  w = 96,
 ): void {
   ctx.save();
-  ctx.fillStyle = '#fff5f5';
-  ctx.strokeStyle = '#d63031';
+  ctx.fillStyle = bg;
+  ctx.strokeStyle = border;
   ctx.lineWidth = 2;
   ctx.beginPath();
-  ctx.roundRect(x - 46, y - 16, 92, 28, 12);
+  ctx.roundRect(x - w / 2, y - 16, w, 28, 12);
   ctx.fill();
   ctx.stroke();
-  ctx.fillStyle = '#c02626';
-  ctx.font = 'bold 13px system-ui, sans-serif';
+  ctx.fillStyle = fg;
+  ctx.font = 'bold 11.5px system-ui, sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText(text, x, y - 1);
@@ -276,19 +312,44 @@ function drawTable(
   tableEdgeX: number,
   tableThickness: number,
   floorY: number,
+  stage: StageConfig,
 ): void {
-  // 桌腿
-  ctx.fillStyle = '#c59b76';
-  ctx.fillRect(tableEdgeX - 30, tableTopY + tableThickness, 18, floorY - (tableTopY + tableThickness));
+  const { palette } = stage;
+  ctx.fillStyle = palette.tableLeg;
+  ctx.fillRect(
+    tableEdgeX - 30,
+    tableTopY + tableThickness,
+    18,
+    floorY - (tableTopY + tableThickness),
+  );
 
-  // 白色平滑桌面
-  ctx.fillStyle = '#fcfaf6';
+  ctx.fillStyle = palette.tableTop;
   ctx.fillRect(0, tableTopY, tableEdgeX, tableThickness);
 
-  // 桌面高光边线与木质下沿
-  ctx.fillStyle = '#e7dfd5';
+  // 材质细节（Stage 3 大理石纹理 / Stage 2 & 4 木纹）
+  if (stage.id === 3) {
+    ctx.strokeStyle = 'rgba(219, 39, 119, 0.14)';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(20, tableTopY + 5);
+    ctx.lineTo(110, tableTopY + 14);
+    ctx.moveTo(170, tableTopY + 4);
+    ctx.lineTo(255, tableTopY + 15);
+    ctx.stroke();
+  } else if (stage.id === 2 || stage.id === 4) {
+    ctx.strokeStyle = 'rgba(0, 0, 0, 0.12)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(12, tableTopY + 7);
+    ctx.lineTo(tableEdgeX - 18, tableTopY + 7);
+    ctx.moveTo(40, tableTopY + 14);
+    ctx.lineTo(tableEdgeX - 40, tableTopY + 14);
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = palette.tableEdgeShade;
   ctx.fillRect(0, tableTopY + tableThickness - 6, tableEdgeX, 6);
-  ctx.strokeStyle = '#cbbba8';
+  ctx.strokeStyle = palette.tableBorder;
   ctx.lineWidth = 1.5;
   ctx.beginPath();
   ctx.moveTo(0, tableTopY);
@@ -296,7 +357,6 @@ function drawTable(
   ctx.lineTo(tableEdgeX, tableTopY + tableThickness);
   ctx.stroke();
 
-  // 悬边危险区提示虚线（桌沿边界）
   ctx.save();
   ctx.strokeStyle = 'rgba(224, 112, 72, 0.35)';
   ctx.setLineDash([4, 4]);
@@ -315,181 +375,289 @@ function drawItem(
 ): void {
   const { body, kind, spec, teeterTier, multiplier } = item;
   const isTeeter = teeterTier !== 'safe';
+  const hw = spec.width / 2;
+  const hh = spec.height / 2;
 
   ctx.save();
-  ctx.translate(body.position.x, body.position.y);
+  const buzzDx = item.isBuzzing ? Math.sin(animTimeSec * 65) * 1.6 : 0;
+  ctx.translate(body.position.x + buzzDx, body.position.y);
   ctx.rotate(body.angle);
 
-  if (kind === 'tissue') {
-    // 揉皱纸巾团
-    ctx.fillStyle = '#ffffff';
-    ctx.strokeStyle = '#d8d2c9';
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.moveTo(-12, 4);
-    ctx.lineTo(-9, -8);
-    ctx.lineTo(2, -10);
-    ctx.lineTo(13, -4);
-    ctx.lineTo(11, 8);
-    ctx.lineTo(-4, 9);
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-
-    // 淡定小豆眼
-    ctx.fillStyle = '#4a4540';
-    ctx.beginPath();
-    ctx.arc(-2, -1, 1.4, 0, Math.PI * 2);
-    ctx.arc(5, -1, 1.4, 0, Math.PI * 2);
-    ctx.fill();
-  } else if (kind === 'pen') {
-    // 容易滚动的圆珠笔截面/滚轴
-    const r = spec.width / 2;
-    ctx.fillStyle = '#e7f5ff';
-    ctx.strokeStyle = '#339af0';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.arc(0, 0, r, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.stroke();
-    // 笔芯标记线，滚动时能明显看出在转
-    ctx.fillStyle = '#1c7ed6';
-    ctx.beginPath();
-    ctx.arc(0, 0, 3, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = '#1c7ed6';
-    ctx.beginPath();
-    ctx.moveTo(0, 0);
-    ctx.lineTo(r - 1, 0);
-    ctx.stroke();
-  } else if (kind === 'mug') {
-    // 花纹陶瓷马克杯 + 惊恐流汗小脸
-    const hw = spec.width / 2;
-    const hh = spec.height / 2;
-
-    // 右侧杯耳
-    ctx.strokeStyle = '#d97b59';
-    ctx.lineWidth = 4;
-    ctx.beginPath();
-    ctx.arc(hw, 0, 8, -Math.PI * 0.5, Math.PI * 0.5);
-    ctx.stroke();
-
-    // 杯身
-    ctx.fillStyle = '#fff5ea';
-    ctx.strokeStyle = '#d97b59';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.roundRect(-hw, -hh, spec.width, spec.height, 4);
-    ctx.fill();
-    ctx.stroke();
-
-    // 波点装饰
-    ctx.fillStyle = '#f2a679';
-    ctx.beginPath();
-    ctx.arc(-9, -11, 2.5, 0, Math.PI * 2);
-    ctx.arc(9, 11, 2.5, 0, Math.PI * 2);
-    ctx.fill();
-
-    // 拟人表情（悬边时惊恐震颤）
-    const shake = isTeeter ? Math.sin(animTimeSec * 40) * 1.2 : 0;
-    ctx.fillStyle = '#2d241e';
-    if (isTeeter) {
+  switch (kind) {
+    case 'tissue': {
       ctx.fillStyle = '#ffffff';
-      ctx.beginPath();
-      ctx.arc(-6 + shake, -2, 4, 0, Math.PI * 2);
-      ctx.arc(6 + shake, -2, 4, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#2d241e';
-      ctx.beginPath();
-      ctx.arc(-6 + shake, -2, 1.5, 0, Math.PI * 2);
-      ctx.arc(6 + shake, -2, 1.5, 0, Math.PI * 2);
-      ctx.fill();
-      // 张嘴惊恐 O
-      ctx.beginPath();
-      ctx.ellipse(shake, 7, 3.2, 4, 0, 0, Math.PI * 2);
-      ctx.fill();
-    } else {
-      ctx.beginPath();
-      ctx.arc(-6, -2, 2.1, 0, Math.PI * 2);
-      ctx.arc(6, -2, 2.1, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.strokeStyle = '#2d241e';
+      ctx.strokeStyle = '#d8d2c9';
       ctx.lineWidth = 1.5;
       ctx.beginPath();
-      ctx.moveTo(-4, 5);
-      ctx.lineTo(4, 5);
+      ctx.moveTo(-12, 4);
+      ctx.lineTo(-9, -8);
+      ctx.lineTo(2, -10);
+      ctx.lineTo(13, -4);
+      ctx.lineTo(11, 8);
+      ctx.lineTo(-4, 9);
+      ctx.closePath();
+      ctx.fill();
       ctx.stroke();
+      drawLittleEyes(ctx, 1.5, -1, 3.5);
+      break;
     }
-  } else if (kind === 'kettle') {
-    // 白色电水壶 Boss
-    const hw = spec.width / 2;
-    const hh = spec.height / 2;
-
-    // 把手
-    ctx.strokeStyle = '#8b95a1';
-    ctx.lineWidth = 5;
-    ctx.beginPath();
-    ctx.roundRect(-hw - 7, -hh + 10, 12, 34, 5);
-    ctx.stroke();
-
-    // 壶嘴
-    ctx.fillStyle = '#e9ecef';
-    ctx.beginPath();
-    ctx.moveTo(hw - 2, -hh + 10);
-    ctx.lineTo(hw + 9, -hh + 14);
-    ctx.lineTo(hw - 1, -hh + 24);
-    ctx.closePath();
-    ctx.fill();
-
-    // 壶身
-    ctx.fillStyle = '#f8f9fa';
-    ctx.strokeStyle = '#adb5bd';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.roundRect(-hw, -hh, spec.width, spec.height, [10, 10, 4, 4]);
-    ctx.fill();
-    ctx.stroke();
-
-    // 黑色底座条与红灯
-    ctx.fillStyle = '#343a40';
-    ctx.fillRect(-hw + 1, hh - 9, spec.width - 2, 8);
-    ctx.fillStyle = '#ff6b6b';
-    ctx.beginPath();
-    ctx.arc(hw - 9, hh - 5, 2.2, 0, Math.PI * 2);
-    ctx.fill();
-
-    // 厚重淡定表情（悬边时也慌了）
-    ctx.fillStyle = '#343a40';
-    ctx.beginPath();
-    ctx.arc(-8, -4, isTeeter ? 3.5 : 2.5, 0, Math.PI * 2);
-    ctx.arc(8, -4, isTeeter ? 3.5 : 2.5, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = '#343a40';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    if (isTeeter) {
-      ctx.arc(0, 8, 5, Math.PI, Math.PI * 2);
-    } else {
-      ctx.moveTo(-6, 6);
-      ctx.lineTo(6, 6);
+    case 'pen':
+    case 'lipstick': {
+      const r = hw;
+      ctx.fillStyle = kind === 'lipstick' ? '#e11d48' : '#e7f5ff';
+      ctx.strokeStyle = kind === 'lipstick' ? '#881337' : '#339af0';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(0, 0, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = kind === 'lipstick' ? '#fda4af' : '#1c7ed6';
+      ctx.beginPath();
+      ctx.arc(0, 0, 2.8, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = kind === 'lipstick' ? '#881337' : '#1c7ed6';
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(r - 1, 0);
+      ctx.stroke();
+      break;
     }
-    ctx.stroke();
+    case 'mug': {
+      ctx.strokeStyle = '#d97b59';
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.arc(hw, 0, 8, -Math.PI * 0.5, Math.PI * 0.5);
+      ctx.stroke();
+      ctx.fillStyle = '#fff5ea';
+      ctx.strokeStyle = '#d97b59';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.roundRect(-hw, -hh, spec.width, spec.height, 4);
+      ctx.fill();
+      ctx.stroke();
+      drawExpressiveFace(ctx, isTeeter, animTimeSec, '#2d241e');
+      break;
+    }
+    case 'kettle': {
+      ctx.strokeStyle = '#8b95a1';
+      ctx.lineWidth = 5;
+      ctx.beginPath();
+      ctx.roundRect(-hw - 7, -hh + 10, 12, 34, 5);
+      ctx.stroke();
+      ctx.fillStyle = '#e9ecef';
+      ctx.beginPath();
+      ctx.moveTo(hw - 2, -hh + 10);
+      ctx.lineTo(hw + 9, -hh + 14);
+      ctx.lineTo(hw - 1, -hh + 24);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = '#f8f9fa';
+      ctx.strokeStyle = '#adb5bd';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.roundRect(-hw, -hh, spec.width, spec.height, [10, 10, 4, 4]);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#343a40';
+      ctx.fillRect(-hw + 1, hh - 9, spec.width - 2, 8);
+      ctx.fillStyle = '#ff6b6b';
+      ctx.beginPath();
+      ctx.arc(hw - 9, hh - 5, 2.2, 0, Math.PI * 2);
+      ctx.fill();
+      drawExpressiveFace(ctx, isTeeter, animTimeSec, '#343a40');
+      break;
+    }
+    case 'mouse': {
+      ctx.fillStyle = '#f8fafc';
+      ctx.strokeStyle = '#64748b';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.roundRect(-hw, -hh, spec.width, spec.height, [10, 10, 4, 4]);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#334155';
+      ctx.fillRect(3, -hh + 2, 5, 4);
+      drawLittleEyes(ctx, -4, 0, 3);
+      break;
+    }
+    case 'ink': {
+      ctx.fillStyle = '#1e293b';
+      ctx.fillRect(-7, -hh - 3, 14, 6);
+      ctx.fillStyle = '#38bdf8';
+      ctx.strokeStyle = '#0f172a';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.roundRect(-hw, -hh + 3, spec.width, spec.height - 3, 5);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(-hw + 3, -2, spec.width - 6, hh);
+      drawLittleEyes(ctx, 0, -6, 4);
+      break;
+    }
+    case 'phone': {
+      ctx.fillStyle = '#1e293b';
+      ctx.strokeStyle = item.isBuzzing ? '#22c55e' : '#475569';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.roundRect(-hw, -hh, spec.width, spec.height, 4);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = item.isBuzzing ? '#4ade80' : '#38bdf8';
+      ctx.fillRect(-hw + 4, -hh + 3, spec.width - 8, spec.height - 6);
+      break;
+    }
+    case 'keyboard': {
+      ctx.fillStyle = '#334155';
+      ctx.strokeStyle = '#0f172a';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.roundRect(-hw, -hh, spec.width, spec.height, 4);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#e2e8f0';
+      for (let kx = -hw + 5; kx < hw - 7; kx += 8) {
+        ctx.fillRect(kx, -hh + 3, 6, 5);
+      }
+      drawLittleEyes(ctx, 0, 3, 6);
+      break;
+    }
+    case 'compact': {
+      ctx.fillStyle = '#fbcfe8';
+      ctx.strokeStyle = '#be185d';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.roundRect(-hw, -hh, spec.width, spec.height, 7);
+      ctx.fill();
+      ctx.stroke();
+      drawLittleEyes(ctx, 0, 0, 4);
+      break;
+    }
+    case 'perfume': {
+      ctx.fillStyle = '#eab308';
+      ctx.fillRect(-5, -hh, 10, 8);
+      ctx.fillStyle = 'rgba(253, 224, 71, 0.72)';
+      ctx.strokeStyle = '#b45309';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.roundRect(-hw, -hh + 8, spec.width, spec.height - 8, 5);
+      ctx.fill();
+      ctx.stroke();
+      drawExpressiveFace(ctx, isTeeter, animTimeSec, '#78350f');
+      break;
+    }
+    case 'mirror': {
+      ctx.fillStyle = '#f8fafc';
+      ctx.strokeStyle = '#be185d';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.roundRect(-hw, -hh, spec.width, spec.height - 8, 16);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#e0f2fe';
+      ctx.beginPath();
+      ctx.roundRect(-hw + 5, -hh + 5, spec.width - 10, spec.height - 18, 12);
+      ctx.fill();
+      ctx.fillStyle = '#9d174d';
+      ctx.fillRect(-hw + 6, hh - 8, spec.width - 12, 8);
+      drawExpressiveFace(ctx, isTeeter, animTimeSec, '#831843');
+      break;
+    }
+    case 'remote': {
+      ctx.fillStyle = '#1f2937';
+      ctx.strokeStyle = '#111827';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.roundRect(-hw, -hh, spec.width, spec.height, 4);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#ef4444';
+      ctx.beginPath();
+      ctx.arc(-hw + 7, 0, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#9ca3af';
+      ctx.fillRect(-4, -3, 18, 6);
+      break;
+    }
+    case 'wineglass': {
+      ctx.strokeStyle = '#94a3b8';
+      ctx.lineWidth = 2.2;
+      ctx.beginPath();
+      ctx.moveTo(0, 2);
+      ctx.lineTo(0, hh - 2);
+      ctx.moveTo(-8, hh - 1);
+      ctx.lineTo(8, hh - 1);
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(241, 245, 249, 0.78)';
+      ctx.strokeStyle = '#64748b';
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      ctx.roundRect(-hw, -hh, spec.width, 28, [3, 3, 10, 10]);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#be123c';
+      ctx.beginPath();
+      ctx.roundRect(-hw + 2, -hh + 12, spec.width - 4, 14, [0, 0, 8, 8]);
+      ctx.fill();
+      drawLittleEyes(ctx, 0, -hh + 7, 4);
+      break;
+    }
+    case 'fishbowl': {
+      // 圆形玻璃鱼缸 + 蓝色水 + 惊慌小金鱼
+      ctx.fillStyle = 'rgba(186, 230, 253, 0.78)';
+      ctx.strokeStyle = '#0284c7';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.roundRect(-hw, -hh, spec.width, spec.height, 22);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(56, 189, 248, 0.55)';
+      ctx.beginPath();
+      ctx.roundRect(-hw + 3, -6, spec.width - 6, hh + 3, [4, 4, 18, 18]);
+      ctx.fill();
+      // 惊慌游动的小金鱼
+      const swimX = Math.sin(animTimeSec * (isTeeter ? 16 : 5)) * 10;
+      const swimY = 6 + Math.cos(animTimeSec * 7) * 3;
+      ctx.fillStyle = '#f97316';
+      ctx.beginPath();
+      ctx.ellipse(swimX, swimY, 7, 4.5, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(swimX - 6, swimY);
+      ctx.lineTo(swimX - 11, swimY - 4);
+      ctx.lineTo(swimX - 11, swimY + 4);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = '#0f172a';
+      ctx.beginPath();
+      ctx.arc(swimX + 3, swimY - 1, 1.3, 0, Math.PI * 2);
+      ctx.fill();
+      break;
+    }
   }
 
   ctx.restore();
 
-  // 悬边流汗与倍率提示（不随刚体旋转，保持水平清晰可读）
-  if (isTeeter) {
-    const labelY = body.position.y - spec.height / 2 - 14;
+  // 手机来电震动提示
+  if (item.isBuzzing) {
     ctx.save();
-    // 汗滴
+    ctx.fillStyle = '#16a34a';
+    ctx.font = 'bold 11px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('嗡嗡!', body.position.x, body.position.y - hh - 10);
+    ctx.restore();
+  }
+
+  // 悬边流汗与倍率提示
+  if (isTeeter) {
+    const labelY = body.position.y - hh - 14;
+    ctx.save();
     ctx.fillStyle = '#4dabf7';
     const dropOffset = (animTimeSec * 14) % 6;
     ctx.beginPath();
-    ctx.arc(body.position.x + spec.width / 2 + 5, body.position.y - 10 + dropOffset, 2.5, 0, Math.PI * 2);
+    ctx.arc(body.position.x + hw + 5, body.position.y - 10 + dropOffset, 2.5, 0, Math.PI * 2);
     ctx.fill();
 
-    // 倍率胶囊
     ctx.fillStyle = multiplier === 3 ? '#e03131' : '#f08c00';
     ctx.beginPath();
     ctx.roundRect(body.position.x - 24, labelY - 10, 48, 18, 9);
@@ -503,6 +671,43 @@ function drawItem(
   }
 }
 
+function drawLittleEyes(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  sep: number,
+): void {
+  ctx.fillStyle = '#1e293b';
+  ctx.beginPath();
+  ctx.arc(cx - sep, cy, 1.4, 0, Math.PI * 2);
+  ctx.arc(cx + sep, cy, 1.4, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawExpressiveFace(
+  ctx: CanvasRenderingContext2D,
+  isTeeter: boolean,
+  animTimeSec: number,
+  color: string,
+): void {
+  const shake = isTeeter ? Math.sin(animTimeSec * 40) * 1.1 : 0;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(-6 + shake, -2, isTeeter ? 3.2 : 2.1, 0, Math.PI * 2);
+  ctx.arc(6 + shake, -2, isTeeter ? 3.2 : 2.1, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.6;
+  ctx.beginPath();
+  if (isTeeter) {
+    ctx.arc(shake, 7, 4, Math.PI, Math.PI * 2);
+  } else {
+    ctx.moveTo(-4, 5);
+    ctx.lineTo(4, 5);
+  }
+  ctx.stroke();
+}
+
 function drawCat(
   ctx: CanvasRenderingContext2D,
   world: CatPushWorld,
@@ -512,14 +717,13 @@ function drawCat(
 ): void {
   const { cat } = world;
   const isNapping = cat.alertness < 0.25;
-  const squashY = 0.72 + cat.alertness * 0.28; // 装睡时压扁贴桌
+  const squashY = 0.72 + cat.alertness * 0.28;
   const stretchX = 1.14 - cat.alertness * 0.14;
 
   ctx.save();
   ctx.translate(cat.x, tableTopY);
   ctx.scale(cat.facing * stretchX, squashY);
 
-  // 尾巴（装睡时卷紧，清醒时微翘摆动）
   const wag = isNapping ? 0 : Math.sin(animTimeSec * (cat.isActive ? 10 : 3)) * 5;
   ctx.strokeStyle = '#e58e3c';
   ctx.lineWidth = 7;
@@ -529,27 +733,25 @@ function drawCat(
   ctx.quadraticCurveTo(-34, -18 + wag, -30, -34 + wag);
   ctx.stroke();
 
-  // 身体（圆润橘猫）
+  // 身体
   ctx.fillStyle = '#f4a259';
   ctx.beginPath();
   ctx.ellipse(-2, -15, 22, 16, 0, 0, Math.PI * 2);
   ctx.fill();
 
-  // 肚皮浅色斑
   ctx.fillStyle = '#fde6cd';
   ctx.beginPath();
   ctx.ellipse(4, -11, 13, 10, 0, 0, Math.PI * 2);
   ctx.fill();
 
   // 猫头
-  const headX = 12;
+  const headX = 10;
   const headY = -30 + (1 - cat.alertness) * 9;
   ctx.fillStyle = '#f4a259';
   ctx.beginPath();
   ctx.arc(headX, headY, 15, 0, Math.PI * 2);
   ctx.fill();
 
-  // 猫耳
   ctx.fillStyle = '#e58e3c';
   ctx.beginPath();
   ctx.moveTo(headX - 11, headY - 9);
@@ -565,7 +767,6 @@ function drawCat(
   ctx.closePath();
   ctx.fill();
 
-  // 额头虎斑 M 纹
   ctx.strokeStyle = '#c86d28';
   ctx.lineWidth = 2;
   ctx.beginPath();
@@ -574,7 +775,6 @@ function drawCat(
   ctx.lineTo(headX + 4, headY - 11);
   ctx.stroke();
 
-  // 3 种瞳孔表情：装睡 ^ ◡ ^ / 推物竖瞳聚焦 / 正常大圆瞳
   if (isNapping) {
     ctx.strokeStyle = '#3b2818';
     ctx.lineWidth = 2;
@@ -585,17 +785,15 @@ function drawCat(
     ctx.arc(headX + 6, headY - 1, 3, Math.PI, Math.PI * 2);
     ctx.stroke();
 
-    // 装睡 Zzz 气泡（在铲屎官盯防时特别搞笑）
     if (steward.phase === 'WATCHING') {
       ctx.save();
-      ctx.scale(cat.facing, 1); // 文字不翻转
+      ctx.scale(cat.facing, 1);
       ctx.fillStyle = '#6c757d';
       ctx.font = 'bold 11px system-ui, sans-serif';
       ctx.fillText('zZ', headX * cat.facing + 8, headY - 20);
       ctx.restore();
     }
   } else {
-    // 眼白/底色
     ctx.fillStyle = '#fff9db';
     ctx.beginPath();
     ctx.arc(headX - 3, headY - 2, 3.8, 0, Math.PI * 2);
@@ -604,13 +802,11 @@ function drawCat(
 
     ctx.fillStyle = '#241b12';
     if (cat.pushingHeavy || cat.pawExtend > 0.5) {
-      // 专注竖瞳（鬼点子生成中！）
       ctx.beginPath();
       ctx.ellipse(headX - 2.5, headY - 2, 1.3, 3.1, 0, 0, Math.PI * 2);
       ctx.ellipse(headX + 7.5, headY - 2, 1.3, 3.1, 0, 0, Math.PI * 2);
       ctx.fill();
     } else {
-      // 正常圆瞳
       ctx.beginPath();
       ctx.arc(headX - 2.5, headY - 2, 2.3, 0, Math.PI * 2);
       ctx.arc(headX + 7.5, headY - 2, 2.3, 0, Math.PI * 2);
@@ -618,25 +814,25 @@ function drawCat(
     }
   }
 
-  // 粉鼻子与小嘴
   ctx.fillStyle = '#f08c8c';
   ctx.beginPath();
   ctx.arc(headX + 3, headY + 3, 1.8, 0, Math.PI * 2);
   ctx.fill();
 
-  // 伸爪推物（手贱猫爪）
+  // 伸爪抵住物体左侧面推动（带扒拉微动画）
   if (cat.pawExtend > 0.08 && !isNapping) {
-    const reach = 12 + cat.pawExtend * 14;
+    const pawBob = cat.pushingHeavy ? Math.sin(animTimeSec * 24) * 2.5 : 0;
+    const reach = 14 + cat.pawExtend * 13 + pawBob;
     ctx.strokeStyle = '#f4a259';
     ctx.lineWidth = 7;
     ctx.beginPath();
-    ctx.moveTo(10, -16);
-    ctx.lineTo(reach, -18);
+    ctx.moveTo(12, -16);
+    ctx.lineTo(reach, -19 + pawBob * 0.6);
     ctx.stroke();
 
     ctx.fillStyle = '#fde6cd';
     ctx.beginPath();
-    ctx.arc(reach + 2, -18, 4.5, 0, Math.PI * 2);
+    ctx.arc(reach + 2, -19 + pawBob * 0.6, 4.5, 0, Math.PI * 2);
     ctx.fill();
   }
 
@@ -671,68 +867,109 @@ function drawParticlesAndFloats(
 
 function drawPlayingHud(
   ctx: CanvasRenderingContext2D,
-  steward: StewardState,
-  bill: BillSummary,
-  muted: boolean,
-  width: number,
-  height: number,
+  world: CatPushWorld,
+  extra: RenderExtra,
+  t: Tuning,
 ): void {
+  const { width, height } = t.view;
+  const { steward, bill, muted, gameMode, stageId } = extra;
+  const stage = STAGES[stageId];
+
   ctx.save();
-  // 顶部半透明信息条
-  ctx.fillStyle = 'rgba(35, 30, 27, 0.78)';
+  ctx.fillStyle = 'rgba(35, 30, 27, 0.8)';
   ctx.beginPath();
   ctx.roundRect(12, 12, width - 24, 52, 14);
   ctx.fill();
 
-  // 倒计时
   ctx.fillStyle = steward.remainingSec <= 10 ? '#ff8787' : '#fff7ea';
   ctx.font = 'bold 18px system-ui, sans-serif';
   ctx.textAlign = 'left';
-  ctx.fillText(`${Math.ceil(steward.remainingSec)}s`, 26, 44);
+  ctx.fillText(`${Math.ceil(steward.remainingSec)}s`, 24, 44);
 
-  // 3 颗红心
   for (let i = 0; i < 3; i++) {
     ctx.fillStyle = i < steward.hearts ? '#ff6b6b' : '#5c534d';
     ctx.font = '16px system-ui, sans-serif';
-    ctx.fillText('♥', 76 + i * 20, 43);
+    ctx.fillText('♥', 72 + i * 19, 43);
   }
 
-  // 噪声条
   ctx.fillStyle = '#a89f96';
   ctx.font = '11px system-ui, sans-serif';
-  ctx.fillText('噪声', 148, 30);
+  ctx.fillText('噪声', 142, 30);
   ctx.fillStyle = '#4a423d';
   ctx.beginPath();
-  ctx.roundRect(148, 36, 76, 8, 4);
+  ctx.roundRect(142, 36, 72, 8, 4);
   ctx.fill();
   ctx.fillStyle =
     steward.noise > 70 ? '#ff6b6b' : steward.noise > 40 ? '#ffd166' : '#69db7c';
   ctx.beginPath();
-  ctx.roundRect(148, 36, (76 * steward.noise) / 100, 8, 4);
+  ctx.roundRect(142, 36, (72 * steward.noise) / 100, 8, 4);
   ctx.fill();
 
-  // 破坏金额
   ctx.fillStyle = '#ffd166';
-  ctx.font = 'bold 17px system-ui, sans-serif';
+  ctx.font = 'bold 16px system-ui, sans-serif';
   ctx.textAlign = 'right';
-  ctx.fillText(`¥${bill.totalScore}`, width - 56, 44);
+  const scoreLabel =
+    gameMode === 'story' ? `¥${bill.totalScore}/${stage.targetScore}` : `¥${bill.totalScore}`;
+  ctx.fillText(scoreLabel, width - 54, 44);
 
-  // 静音按钮
   ctx.fillStyle = 'rgba(255,255,255,0.12)';
   ctx.beginPath();
-  ctx.arc(width - 32, 38, 14, 0, Math.PI * 2);
+  ctx.arc(width - 30, 38, 14, 0, Math.PI * 2);
   ctx.fill();
   ctx.fillStyle = '#fff7ea';
   ctx.font = '13px system-ui, sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(muted ? '🔇' : '🔊', width - 32, 39);
+  ctx.fillText(muted ? '🔇' : '🔊', width - 30, 39);
+
+  // 关卡标签条
+  if (gameMode === 'story') {
+    ctx.fillStyle = 'rgba(35, 30, 27, 0.72)';
+    ctx.beginPath();
+    ctx.roundRect(16, 68, 140, 20, 10);
+    ctx.fill();
+    ctx.fillStyle = '#fde68a';
+    ctx.font = 'bold 11px system-ui, sans-serif';
+    ctx.fillText(stage.name, 86, 78);
+  }
+
+  // 右下角触屏「轻拍! (Space)」动作按钮 + 冷却弧
+  const tapBtn = t.buttons.tap;
+  const cdRatio = clamp(world.cat.tapCooldownSec / t.cat.tapCooldownSec, 0, 1);
+  const ready = cdRatio <= 0.01;
+  ctx.fillStyle = ready ? 'rgba(224, 112, 64, 0.94)' : 'rgba(71, 85, 105, 0.88)';
+  ctx.beginPath();
+  ctx.arc(tapBtn.x, tapBtn.y, tapBtn.r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = ready ? '#fde68a' : '#94a3b8';
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
+
+  if (!ready) {
+    ctx.strokeStyle = '#38bdf8';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.arc(
+      tapBtn.x,
+      tapBtn.y,
+      tapBtn.r - 3,
+      -Math.PI / 2,
+      -Math.PI / 2 + (1 - cdRatio) * Math.PI * 2,
+    );
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 14px system-ui, sans-serif';
+  ctx.fillText('轻拍!', tapBtn.x, tapBtn.y - 5);
+  ctx.font = '600 9.5px system-ui, sans-serif';
+  ctx.fillText('(Space)', tapBtn.x, tapBtn.y + 11);
 
   // 底部极简操控提示
-  ctx.fillStyle = 'rgba(255, 247, 234, 0.72)';
-  ctx.font = '12px system-ui, sans-serif';
+  ctx.fillStyle = 'rgba(255, 247, 234, 0.78)';
+  ctx.font = '11.5px system-ui, sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText('按住左/右推物 · 松手立刻装睡 · Space 轻拍', width / 2, height - 16);
+  ctx.fillText('按住左/右推物 · 松手装睡 · 右下轻拍', width / 2 - 22, height - 16);
 
   ctx.restore();
 }
@@ -741,52 +978,104 @@ function drawTitleOverlay(
   ctx: CanvasRenderingContext2D,
   width: number,
   height: number,
-  bestScore: number,
+  gameMode: GameMode,
+  stageId: StageId,
+  progress: StageProgress,
 ): void {
   ctx.save();
-  ctx.fillStyle = 'rgba(28, 22, 18, 0.62)';
+  ctx.fillStyle = 'rgba(28, 22, 18, 0.64)';
   ctx.fillRect(0, 0, width, height);
 
   ctx.fillStyle = '#fff8ef';
   ctx.beginPath();
-  ctx.roundRect(28, 120, width - 56, 360, 24);
+  ctx.roundRect(22, 92, width - 44, 412, 24);
   ctx.fill();
 
   ctx.fillStyle = '#e07040';
-  ctx.font = 'bold 13px system-ui, sans-serif';
+  ctx.font = 'bold 12px system-ui, sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText('CAT PUSH · 鬼点子生成中', width / 2, 160);
+  ctx.fillText('CAT PUSH · 鬼点子生成中', width / 2, 120);
 
   ctx.fillStyle = '#2b241f';
-  ctx.font = 'bold 26px system-ui, sans-serif';
-  ctx.fillText('把东西推下桌！', width / 2, 198);
+  ctx.font = 'bold 23px system-ui, sans-serif';
+  ctx.fillText('把东西推下桌！', width / 2, 148);
 
-  ctx.fillStyle = '#5e534a';
-  ctx.font = '14px system-ui, sans-serif';
-  const lines = [
-    '1. 按住屏幕右半边/按 D → 悄悄推向桌沿',
-    '2. 推到悬空一半 (×2 / ×3) 再推落赚翻倍',
-    '3. 铲屎官头顶冒「?」立刻松手装睡！',
-    '4. 滚落中的圆珠笔也会当场出卖你',
+  // 双模式切换开关 (y: 168..200)
+  const modes: Array<{ id: GameMode; label: string; x: number }> = [
+    { id: 'story', label: '闯关捣蛋 (4关)', x: 40 },
+    { id: 'endless', label: '无尽茶水间', x: 200 },
   ];
-  lines.forEach((line, idx) => {
-    ctx.fillText(line, width / 2, 246 + idx * 30);
-  });
-
-  if (bestScore > 0) {
-    ctx.fillStyle = '#c96f2d';
-    ctx.font = 'bold 14px system-ui, sans-serif';
-    ctx.fillText(`历史最高破坏账单：¥${bestScore}`, width / 2, 382);
+  for (const m of modes) {
+    const active = gameMode === m.id;
+    ctx.fillStyle = active ? '#e07040' : '#efe5d8';
+    ctx.beginPath();
+    ctx.roundRect(m.x, 168, 150, 32, 12);
+    ctx.fill();
+    ctx.fillStyle = active ? '#ffffff' : '#5e534a';
+    ctx.font = 'bold 13px system-ui, sans-serif';
+    ctx.fillText(m.label, m.x + 75, 188);
   }
 
-  // 开始按钮
+  if (gameMode === 'story') {
+    // 4 个主题房间选关卡片 (y: 214..274)
+    STAGE_IDS.forEach((id, idx) => {
+      const st = STAGES[id];
+      const unlocked = id <= progress.unlockedStage;
+      const selected = stageId === id;
+      const sx = 34 + idx * 82;
+      ctx.fillStyle = selected ? '#2b241f' : unlocked ? '#f3e8da' : '#e5ded5';
+      ctx.beginPath();
+      ctx.roundRect(sx, 214, 76, 62, 12);
+      ctx.fill();
+      if (selected) {
+        ctx.strokeStyle = '#e07040';
+        ctx.lineWidth = 2.5;
+        ctx.stroke();
+      }
+      ctx.fillStyle = selected ? '#ffffff' : unlocked ? '#2b241f' : '#9c9288';
+      ctx.font = 'bold 12px system-ui, sans-serif';
+      ctx.fillText(unlocked ? st.shortName : `🔒${id}关`, sx + 38, 234);
+
+      const stars = progress.stars[id];
+      ctx.fillStyle = stars > 0 ? '#f59e0b' : '#b8ada2';
+      ctx.font = '11px system-ui, sans-serif';
+      ctx.fillText('★'.repeat(stars) + '☆'.repeat(3 - stars), sx + 38, 252);
+
+      ctx.fillStyle = selected ? '#fde68a' : '#7a6f64';
+      ctx.font = '10px system-ui, sans-serif';
+      ctx.fillText(`¥${st.targetScore}`, sx + 38, 267);
+    });
+
+    const cur = STAGES[stageId];
+    ctx.fillStyle = '#5e534a';
+    ctx.font = 'bold 13.5px system-ui, sans-serif';
+    ctx.fillText(`${cur.name} · 目标 ¥${cur.targetScore}`, width / 2, 304);
+    ctx.font = '12.5px system-ui, sans-serif';
+    ctx.fillText(cur.subtitle, width / 2, 326);
+    ctx.fillText('趁主人分心/背对推向桌沿，冒「?」立刻松手装睡！', width / 2, 354);
+    ctx.fillText('悬边摇晃(×2/×3)再推落翻倍，高重心香水别桌上摔碎', width / 2, 378);
+  } else {
+    ctx.fillStyle = '#5e534a';
+    ctx.font = '13.5px system-ui, sans-serif';
+    const lines = [
+      '60 秒茶水间无限补货冲榜！',
+      '第 2 桌起物品站位与间距随机打乱',
+      '趁主人📱回消息分心猛推重物电水壶！',
+      `无尽最高破坏账单：¥${progress.endlessBestScore}`,
+    ];
+    lines.forEach((line, idx) => {
+      ctx.fillText(line, width / 2, 246 + idx * 32);
+    });
+  }
+
+  // 开始按钮 (y: 416..468)
   ctx.fillStyle = '#e07040';
   ctx.beginPath();
-  ctx.roundRect(64, 408, width - 128, 50, 16);
+  ctx.roundRect(64, 416, width - 128, 52, 16);
   ctx.fill();
   ctx.fillStyle = '#ffffff';
   ctx.font = 'bold 18px system-ui, sans-serif';
-  ctx.fillText('开始捣蛋', width / 2, 439);
+  ctx.fillText('开始捣蛋', width / 2, 447);
 
   ctx.restore();
 }
@@ -795,54 +1084,82 @@ function drawResultOverlay(
   ctx: CanvasRenderingContext2D,
   width: number,
   height: number,
-  steward: StewardState,
-  bill: BillSummary,
-  bestScore: number,
+  extra: RenderExtra,
 ): void {
+  const { steward, bill, gameMode, stageId, progress } = extra;
+  const stage = STAGES[stageId];
+
   ctx.save();
   ctx.fillStyle = 'rgba(24, 18, 15, 0.72)';
   ctx.fillRect(0, 0, width, height);
 
   ctx.fillStyle = '#fff9f2';
   ctx.beginPath();
-  ctx.roundRect(26, 108, width - 52, 412, 24);
+  ctx.roundRect(24, 96, width - 48, 444, 24);
   ctx.fill();
 
   const caughtOut = steward.endReason === 'hearts_zero';
-  ctx.fillStyle = caughtOut ? '#d63031' : '#e07040';
-  ctx.font = 'bold 22px system-ui, sans-serif';
+  const passedStory =
+    gameMode === 'story' && !caughtOut && bill.totalScore >= stage.targetScore;
+  ctx.fillStyle = caughtOut ? '#d63031' : passedStory ? '#059669' : '#e07040';
+  ctx.font = 'bold 21px system-ui, sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText(caughtOut ? '被当场抓包！' : '60 秒捣蛋结算', width / 2, 154);
+  const title = caughtOut
+    ? '被当场抓包！'
+    : gameMode === 'story'
+      ? passedStory
+        ? `${stage.shortName} 通关成功！`
+        : '目标金额未达成'
+      : '60 秒捣蛋结算';
+  ctx.fillText(title, width / 2, 138);
 
   ctx.fillStyle = '#2b241f';
   ctx.font = 'bold 34px system-ui, sans-serif';
-  ctx.fillText(`赔偿 ¥${bill.totalScore}`, width / 2, 204);
+  ctx.fillText(`赔偿 ¥${bill.totalScore}`, width / 2, 186);
+
+  if (gameMode === 'story') {
+    const stars = progress.stars[stageId];
+    ctx.fillStyle = '#f59e0b';
+    ctx.font = 'bold 22px system-ui, sans-serif';
+    ctx.fillText('★'.repeat(stars) + '☆'.repeat(3 - stars), width / 2, 220);
+  }
 
   ctx.fillStyle = '#6c5f55';
-  ctx.font = '14px system-ui, sans-serif';
+  ctx.font = '13.5px system-ui, sans-serif';
+  const totalDropped = bill.records.length;
   const rows = [
-    `推落纸巾团：${bill.counts.tissue} 个`,
-    `滚落圆珠笔：${bill.counts.pen} 支`,
-    `打碎马克杯：${bill.counts.mug} 个`,
-    `推翻电水壶：${bill.counts.kettle} 个`,
-    `悬边挑衅成功：${bill.teeterDrops} 次（极限 ${bill.extremeTeeterDrops} 次）`,
+    `共推落物品：${totalDropped} 件`,
+    `悬边挑衅成功：${bill.teeterDrops} 次（极限 ×3 共 ${bill.extremeTeeterDrops} 次）`,
+    bill.damagedDrops > 0
+      ? `桌上提前摔碎折损：${bill.damagedDrops} 件（仅得半价）`
+      : `剩余忍耐红心：${steward.hearts} / 3`,
+    gameMode === 'story'
+      ? `本关目标：¥${stage.targetScore} · 最高 ¥${progress.bestScores[stageId]}`
+      : `无尽最高赔偿：¥${progress.endlessBestScore}`,
   ];
   rows.forEach((row, i) => {
-    ctx.fillText(row, width / 2, 250 + i * 28);
+    ctx.fillText(row, width / 2, 260 + i * 30);
   });
 
-  ctx.fillStyle = '#c96f2d';
-  ctx.font = 'bold 14px system-ui, sans-serif';
-  ctx.fillText(`本机最高赔偿：¥${Math.max(bestScore, bill.totalScore)}`, width / 2, 408);
+  if (gameMode === 'story' && passedStory && stageId < 4) {
+    // 下一关按钮 (y: 404..452)
+    ctx.fillStyle = '#059669';
+    ctx.beginPath();
+    ctx.roundRect(64, 404, width - 128, 48, 16);
+    ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 17px system-ui, sans-serif';
+    ctx.fillText(`进入 ${STAGES[(stageId + 1) as StageId].shortName}`, width / 2, 433);
+  }
 
-  // 再来一桌按钮
+  // 再来一桌 / 返回按钮 (y: 462..512)
   ctx.fillStyle = '#2b241f';
   ctx.beginPath();
-  ctx.roundRect(64, 434, width - 128, 52, 16);
+  ctx.roundRect(64, 462, width - 128, 50, 16);
   ctx.fill();
   ctx.fillStyle = '#ffffff';
-  ctx.font = 'bold 18px system-ui, sans-serif';
-  ctx.fillText('再来一桌 (R)', width / 2, 466);
+  ctx.font = 'bold 17px system-ui, sans-serif';
+  ctx.fillText('再来一桌 (R)', width / 2, 492);
 
   ctx.restore();
 }
@@ -881,12 +1198,12 @@ function drawDebugOverlay(
   }
 
   ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
-  ctx.fillRect(8, height - 62, 260, 38);
+  ctx.fillRect(8, height - 62, 272, 38);
   ctx.fillStyle = '#00e5ff';
   ctx.font = '10px ui-monospace, Consolas, monospace';
   ctx.textAlign = 'left';
   ctx.fillText(
-    `steward=${steward.phase} t=${steward.phaseTimerSec.toFixed(2)}s noise=${steward.noise.toFixed(1)}`,
+    `steward=${steward.phase} t=${steward.phaseTimerSec.toFixed(2)}s dist=${steward.distractTimerSec.toFixed(1)}s`,
     14,
     height - 46,
   );

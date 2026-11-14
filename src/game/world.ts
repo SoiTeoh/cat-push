@@ -1,8 +1,13 @@
 import Matter from 'matter-js';
+import { STAGES } from '../config/stages';
 import { tuning, type ItemKind, type ItemSpec, type Tuning } from '../config/tuning';
 import {
+  buildWaveLayout,
+  calculateDropScore,
   clamp,
   evaluateTeeterState,
+  isFragileBrokenOnTable,
+  stepPhoneBuzz,
   type TeeterTier,
 } from './rules';
 
@@ -16,6 +21,8 @@ export interface TableItem {
   multiplier: 1 | 2 | 3;
   dropped: boolean;
   settledAfterDrop: boolean;
+  buzzCycleSec: number;
+  isBuzzing: boolean;
 }
 
 export interface CatState {
@@ -41,21 +48,17 @@ export interface DroppedNotice {
   readonly multiplier: 1 | 2 | 3;
   readonly score: number;
   readonly heavy: boolean;
+  readonly brokeOnTable: boolean;
 }
 
 export interface WorldStepResult {
   readonly droppedItems: readonly DroppedNotice[];
   readonly addedNoise: number;
   readonly hasMovingItem: boolean;
+  readonly hasTeeteringItem: boolean;
   readonly waveCleared: boolean;
+  readonly phoneBuzzed: boolean;
 }
-
-const DEFAULT_WAVE_LAYOUT: ReadonlyArray<{ kind: ItemKind; x: number }> = [
-  { kind: 'kettle', x: 132 },
-  { kind: 'mug', x: 204 },
-  { kind: 'pen', x: 244 },
-  { kind: 'tissue', x: 270 },
-];
 
 export class CatPushWorld {
   public readonly engine: Matter.Engine;
@@ -67,7 +70,10 @@ export class CatPushWorld {
 
   private nextItemId = 1;
 
-  constructor(private readonly t: Tuning = tuning) {
+  constructor(
+    private readonly t: Tuning = tuning,
+    initialItems: readonly ItemKind[] = STAGES[1].items,
+  ) {
     this.engine = Matter.Engine.create({
       gravity: { x: 0, y: 1.15, scale: 0.001 },
       positionIterations: 8,
@@ -123,21 +129,22 @@ export class CatPushWorld {
       tapCooldownSec: 0,
     };
 
-    this.spawnWave(1);
+    this.spawnWave(1, initialItems);
   }
 
-  public spawnWave(waveNumber: number): void {
-    // 清理上一波残留刚体
+  public spawnWave(
+    waveNumber: number,
+    stageItems: readonly ItemKind[] = STAGES[1].items,
+  ): void {
     for (const item of this.items) {
       Matter.Composite.remove(this.engine.world, item.body);
     }
     this.items.length = 0;
     this.waveCount = waveNumber;
 
-    // 随波次微调摆放，保持第一波 4 种物品齐全
-    const jitter = ((waveNumber - 1) % 3) * 8;
-    for (const slot of DEFAULT_WAVE_LAYOUT) {
-      this.spawnItem(slot.kind, clamp(slot.x - jitter, 96, this.t.scene.tableEdgeX - 24));
+    const layout = buildWaveLayout(waveNumber, stageItems, this.t.scene.tableEdgeX);
+    for (const slot of layout) {
+      this.spawnItem(slot.kind, slot.x);
     }
   }
 
@@ -156,7 +163,7 @@ export class CatPushWorld {
     };
 
     let body: Matter.Body;
-    if (kind === 'pen') {
+    if (kind === 'pen' || kind === 'lipstick') {
       body = Matter.Bodies.circle(x, spawnY, spec.width / 2, common);
     } else if (kind === 'tissue') {
       body = Matter.Bodies.polygon(x, spawnY, 6, spec.width * 0.45, {
@@ -166,7 +173,7 @@ export class CatPushWorld {
     } else {
       body = Matter.Bodies.rectangle(x, spawnY, spec.width, spec.height, {
         ...common,
-        chamfer: { radius: kind === 'kettle' ? 5 : 3 },
+        chamfer: { radius: spec.heavy ? 6 : 3 },
       });
     }
 
@@ -181,6 +188,8 @@ export class CatPushWorld {
       multiplier: 1,
       dropped: false,
       settledAfterDrop: false,
+      buzzCycleSec: 0.8,
+      isBuzzing: false,
     };
     this.items.push(item);
     return item;
@@ -196,6 +205,7 @@ export class CatPushWorld {
     let addedNoise = 0;
     let pushingAny = false;
     let pushingHeavy = false;
+    let phoneBuzzed = false;
 
     this.cat.tapCooldownSec = Math.max(0, this.cat.tapCooldownSec - dtSec);
 
@@ -213,11 +223,22 @@ export class CatPushWorld {
       this.cat.alertness = clamp(this.cat.alertness + dtSec / 0.08, 0, 1);
       if (moveDir !== 0) {
         this.cat.facing = moveDir;
-        this.cat.x = clamp(
+        let nextX = clamp(
           this.cat.x + moveDir * this.t.cat.moveSpeed * dtSec,
           this.t.cat.minX,
           this.t.cat.maxX,
         );
+        // 防止猫身穿过桌面物体：向右推时猫身停靠在物体左边缘外侧，只伸前爪抵住左侧面
+        if (moveDir > 0) {
+          for (const item of this.items) {
+            if (item.dropped || item.body.position.y > this.t.scene.tableTopY + 12) continue;
+            const leftEdge = item.body.position.x - item.spec.width * 0.5;
+            if (this.cat.x <= item.body.position.x && nextX + this.t.cat.bodyHalfW > leftEdge - 2) {
+              nextX = Math.min(nextX, Math.max(this.t.cat.minX, leftEdge - this.t.cat.bodyHalfW - 2));
+            }
+          }
+        }
+        this.cat.x = nextX;
       }
     } else {
       this.cat.idleSec += dtSec;
@@ -240,37 +261,56 @@ export class CatPushWorld {
         const leftEdge = b.position.x - halfW;
         const rightEdge = b.position.x + halfW;
 
-        // 猫爪位于物体左侧附近（或轻拍范围内）
         const inPushZone =
           pawX >= leftEdge - 14 &&
-          this.cat.x <= rightEdge - 4 &&
-          b.position.x >= this.cat.x - 6;
+          this.cat.x <= rightEdge - 2 &&
+          b.position.x >= this.cat.x - 4;
 
         if (!inPushZone) continue;
 
         pushingAny = true;
-        if (item.kind === 'mug' || item.kind === 'kettle') {
+        if (item.spec.heavy) {
           pushingHeavy = true;
         }
 
         if (canTap) {
-          // 轻拍：对所有物体给一次明显横向速度冲量，重物也能动一下
-          const tapSpeed =
-            item.spec.maxNudgeSpeed * 1.45 +
-            (this.t.cat.tapImpulseSpeedBoost * 0.001) / Math.max(item.spec.density, 0.0005);
+          const tapSpeed = item.spec.heavy
+            ? clamp(item.spec.maxNudgeSpeed * 2.2 + 0.55, 0.85, 2.0)
+            : clamp(
+                item.spec.maxNudgeSpeed * 1.45 +
+                  (this.t.cat.tapImpulseSpeedBoost * 0.001) / Math.max(item.spec.density, 0.0005),
+                1.4,
+                5.0,
+              );
           Matter.Body.setVelocity(b, {
-            x: Math.max(b.velocity.x, clamp(tapSpeed, 1.4, 5.2)),
-            y: b.velocity.y - 0.35,
+            x: Math.max(b.velocity.x, tapSpeed),
+            y: b.velocity.y - (item.spec.heavy ? 0.18 : 0.35),
           });
         } else if (moveDir > 0) {
-          // 平滑速度引导：根据物体质量限定最大推速，防止飞出屏幕
           const targetVx = item.spec.maxNudgeSpeed;
           if (b.velocity.x < targetVx) {
-            const nextVx = Math.min(targetVx, b.velocity.x + (targetVx * 0.32 + 0.14));
+            const accel = item.spec.heavy ? targetVx * 0.25 + 0.04 : targetVx * 0.32 + 0.14;
+            const nextVx = Math.min(targetVx, b.velocity.x + accel);
             Matter.Body.setVelocity(b, { x: nextVx, y: b.velocity.y });
           }
           addedNoise += item.spec.pushNoisePerSec * dtSec;
         }
+      }
+    }
+
+    // 来电震动手机自滑机制
+    for (const item of this.items) {
+      if (item.dropped || !item.spec.selfBuzz) continue;
+      if (item.body.position.y > this.t.scene.tableTopY + 12) continue;
+      const buzz = stepPhoneBuzz(item.buzzCycleSec, dtSec);
+      item.buzzCycleSec = buzz.nextCycleSec;
+      item.isBuzzing = buzz.isBuzzing;
+      if (buzz.shouldSlideImpulse) {
+        phoneBuzzed = true;
+        Matter.Body.setVelocity(item.body, {
+          x: Math.max(item.body.velocity.x, 0.72),
+          y: item.body.velocity.y - 0.08,
+        });
       }
     }
 
@@ -283,6 +323,7 @@ export class CatPushWorld {
 
     const droppedItems: DroppedNotice[] = [];
     let hasMovingItem = false;
+    let hasTeeteringItem = false;
 
     for (const item of this.items) {
       const b = item.body;
@@ -307,20 +348,51 @@ export class CatPushWorld {
         item.teeterHoldSec = teeter.holdSec;
         item.teeterTier = teeter.tier;
         item.multiplier = teeter.multiplier;
+        if (item.multiplier >= 2) {
+          hasTeeteringItem = true;
+        }
+
+        // 高重心易碎物在桌面上提前倾倒碎裂（只拿一半折损分）
+        if (
+          isFragileBrokenOnTable(
+            item.kind,
+            b.position.x,
+            b.angle,
+            this.t.scene.tableEdgeX,
+            this.t,
+          )
+        ) {
+          item.dropped = true;
+          item.settledAfterDrop = true;
+          addedNoise += item.spec.dropNoise * 0.7;
+          const score = calculateDropScore(item.kind, 1, true, this.t);
+          droppedItems.push({
+            kind: item.kind,
+            x: b.position.x,
+            y: this.t.scene.tableTopY - 8,
+            multiplier: 1,
+            score,
+            heavy: false,
+            brokeOnTable: true,
+          });
+          Matter.Composite.remove(this.engine.world, b);
+          continue;
+        }
 
         // 触发地板 sensor（或完全跌落到地板线下方）
         if (b.position.y + item.spec.height * 0.4 >= this.t.scene.floorY) {
           item.dropped = true;
           item.settledAfterDrop = true;
           addedNoise += item.spec.dropNoise;
-          const score = Math.round(item.spec.baseScore * item.multiplier);
+          const score = calculateDropScore(item.kind, item.multiplier, false, this.t);
           droppedItems.push({
             kind: item.kind,
             x: b.position.x,
             y: this.t.scene.floorY - 8,
             multiplier: item.multiplier,
             score,
-            heavy: item.kind === 'mug' || item.kind === 'kettle',
+            heavy: Boolean(item.spec.heavy),
+            brokeOnTable: false,
           });
           Matter.Composite.remove(this.engine.world, b);
         }
@@ -333,7 +405,9 @@ export class CatPushWorld {
       droppedItems,
       addedNoise,
       hasMovingItem,
+      hasTeeteringItem,
       waveCleared,
+      phoneBuzzed,
     };
   }
 }

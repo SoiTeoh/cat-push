@@ -1,12 +1,21 @@
 import { describe, expect, it } from 'vitest';
+import { STAGES, STAGE_IDS } from '../src/config/stages';
 import { tuning } from '../src/config/tuning';
 import {
+  applyStageResult,
+  buildWaveLayout,
+  calculateDropScore,
   computeRelaxedInterval,
   createBillSummary,
+  createInitialProgress,
   createStewardState,
+  evaluateStageStars,
   evaluateTeeterState,
+  isFragileBrokenOnTable,
   recordItemDrop,
+  stepPhoneBuzz,
   stepSteward,
+  type StewardState,
 } from '../src/game/rules';
 
 const DEG = Math.PI / 180;
@@ -160,7 +169,7 @@ describe('stepSteward', () => {
     expect(s.hearts).toBe(tuning.steward.maxHearts - 1);
   });
 
-  it('recovers from CAUGHT to RELAXED after caughtFreezeSec when hearts remain', () => {
+  it('recovers from CAUGHT to RELAXED after caughtPauseSec when hearts remain', () => {
     let s = createStewardState(tuning);
     s = { ...s, phase: 'CAUGHT', phaseTimerSec: 0.1, hearts: 2 };
     s = stepSteward(
@@ -228,22 +237,187 @@ describe('stepSteward', () => {
     );
     expect(after).toEqual(s);
   });
+
+  it('extends WATCHING by +0.6s and flags suspiciousTeeter when teeter suspicion is enabled', () => {
+    let s = createStewardState(tuning);
+    s = { ...s, phase: 'WARNING', phaseTimerSec: 0.05 };
+    s = stepSteward(
+      s,
+      {
+        dtSec: 0.1,
+        playerActive: false,
+        hasMovingItem: false,
+        itemDroppedDuringStep: false,
+        addedNoise: 0,
+        hasTeeteringItem: true,
+        enableTeeterSuspicion: true,
+        watchRoll: 0,
+      },
+      tuning,
+    );
+    expect(s.phase).toBe('WATCHING');
+    expect(s.suspiciousTeeter).toBe(true);
+    expect(s.teeterPenaltyActive).toBe(true);
+    expect(s.phaseTimerSec).toBeCloseTo(
+      tuning.steward.watchMinSec + tuning.steward.teeterWatchBonusSec,
+      4,
+    );
+  });
+
+  it('shortens next RELAXED interval when teeterPenaltyActive is true', () => {
+    const baseInterval = computeRelaxedInterval(0, tuning);
+    let s: StewardState = {
+      ...createStewardState(tuning),
+      phase: 'RELAXED',
+      teeterPenaltyActive: true,
+      relaxedElapsedSec: baseInterval - tuning.steward.teeterRelaxedPenaltySec - 0.05,
+    };
+    s = stepSteward(
+      s,
+      {
+        dtSec: 0.1,
+        playerActive: false,
+        hasMovingItem: false,
+        itemDroppedDuringStep: false,
+        addedNoise: 0,
+      },
+      tuning,
+    );
+    expect(s.phase).toBe('WARNING');
+  });
+
+  it('blocks WARNING transition while steward distraction window is active', () => {
+    let s: StewardState = {
+      ...createStewardState(tuning),
+      phase: 'RELAXED',
+      relaxedElapsedSec: 10,
+      distractTimerSec: 2.0,
+    };
+    s = stepSteward(
+      s,
+      {
+        dtSec: 0.5,
+        playerActive: false,
+        hasMovingItem: false,
+        itemDroppedDuringStep: false,
+        addedNoise: 80,
+      },
+      tuning,
+    );
+    expect(s.phase).toBe('RELAXED');
+    expect(s.distractTimerSec).toBeCloseTo(1.5, 4);
+  });
+
+  it('triggers distraction window when distractCooldownSec reaches 0 during RELAXED', () => {
+    let s: StewardState = {
+      ...createStewardState(tuning),
+      phase: 'RELAXED',
+      distractCooldownSec: 0.1,
+    };
+    s = stepSteward(
+      s,
+      {
+        dtSec: 0.2,
+        playerActive: false,
+        hasMovingItem: false,
+        itemDroppedDuringStep: false,
+        addedNoise: 0,
+        distractRoll: 0.5,
+      },
+      tuning,
+    );
+    expect(s.phase).toBe('RELAXED');
+    expect(s.distractTimerSec).toBeCloseTo(tuning.steward.distractDurationSec, 4);
+  });
 });
 
-describe('recordItemDrop & createBillSummary', () => {
-  it('accumulates base scores, multipliers, and teeter counts accurately', () => {
+describe('Fragile Items, Phone Buzz & Wave Layout', () => {
+  it('detects premature table shatter for perfume and wineglass when tilted >= 65 deg away from edge', () => {
+    const edgeX = tuning.scene.tableEdgeX;
+    expect(isFragileBrokenOnTable('perfume', edgeX - 60, 70 * DEG, edgeX, tuning)).toBe(true);
+    expect(isFragileBrokenOnTable('wineglass', edgeX - 80, -68 * DEG, edgeX, tuning)).toBe(true);
+    // Near the edge (>= edgeX - edgeMarginPx), tilting is teetering, not table-break
+    expect(isFragileBrokenOnTable('perfume', edgeX - 10, 70 * DEG, edgeX, tuning)).toBe(false);
+    // Non-fragile items never break on table
+    expect(isFragileBrokenOnTable('kettle', edgeX - 60, 80 * DEG, edgeX, tuning)).toBe(false);
+  });
+
+  it('awards 50% damaged score when brokeOnTable is true vs full multiplied score when pushed off', () => {
+    expect(calculateDropScore('perfume', 3, true, tuning)).toBe(110);
+    expect(calculateDropScore('perfume', 3, false, tuning)).toBe(660);
+    expect(calculateDropScore('wineglass', 2, true, tuning)).toBe(130);
+    expect(calculateDropScore('wineglass', 2, false, tuning)).toBe(520);
+  });
+
+  it('steps phone buzz cycle and emits slide impulse when entering buzz window', () => {
+    const r1 = stepPhoneBuzz(3.4, 0.2, 4.2, 0.65);
+    expect(r1.isBuzzing).toBe(true);
+    expect(r1.shouldSlideImpulse).toBe(true);
+
+    const r2 = stepPhoneBuzz(3.7, 0.2, 4.2, 0.65);
+    expect(r2.isBuzzing).toBe(true);
+    expect(r2.shouldSlideImpulse).toBe(false);
+  });
+
+  it('keeps wave 1 in canonical order and shuffles wave 2+ so order differs from wave 1', () => {
+    const items = STAGES[1].items;
+    const w1 = buildWaveLayout(1, items, tuning.scene.tableEdgeX);
+    expect(w1.map((s) => s.kind)).toEqual(items);
+
+    const w2 = buildWaveLayout(2, items, tuning.scene.tableEdgeX, () => 0.99);
+    expect(w2).toHaveLength(items.length);
+    expect(w2.map((s) => s.kind)).not.toEqual(items);
+  });
+});
+
+describe('Stages, Stars & BillSummary', () => {
+  it('defines 4 distinct stages with increasing target scores and unique items', () => {
+    expect(STAGE_IDS).toEqual([1, 2, 3, 4]);
+    expect(STAGES[1].targetScore).toBe(300);
+    expect(STAGES[2].targetScore).toBe(550);
+    expect(STAGES[3].targetScore).toBe(800);
+    expect(STAGES[4].targetScore).toBe(1100);
+    expect(STAGES[1].enableTeeterSuspicion).toBe(false);
+    expect(STAGES[2].enableTeeterSuspicion).toBe(true);
+  });
+
+  it('evaluates 0..3 stage stars accurately based on score, targetScore, and hearts', () => {
+    expect(evaluateStageStars(299, 300, 3)).toBe(0);
+    expect(evaluateStageStars(500, 300, 0)).toBe(0);
+    expect(evaluateStageStars(320, 300, 1)).toBe(1);
+    expect(evaluateStageStars(320, 300, 3)).toBe(2);
+    expect(evaluateStageStars(410, 300, 2)).toBe(2);
+    expect(evaluateStageStars(530, 300, 2)).toBe(3);
+  });
+
+  it('unlocks next stage and preserves best star & score in StageProgress', () => {
+    let p = createInitialProgress();
+    p = applyStageResult(p, 1, 350, 2);
+    expect(p.unlockedStage).toBe(2);
+    expect(p.stars[1]).toBe(2);
+    expect(p.bestScores[1]).toBe(350);
+
+    // Replaying with lower stars keeps higher star record
+    p = applyStageResult(p, 1, 310, 1);
+    expect(p.stars[1]).toBe(2);
+    expect(p.bestScores[1]).toBe(350);
+  });
+
+  it('accumulates base scores, multipliers, teeter counts, and damagedDrops accurately', () => {
     let bill = createBillSummary();
     expect(bill.totalScore).toBe(0);
 
     bill = recordItemDrop(bill, 'tissue', 1, tuning); // +10
     bill = recordItemDrop(bill, 'pen', 2, tuning); // +60, teeterDrops=1
     bill = recordItemDrop(bill, 'mug', 3, tuning); // +240, teeterDrops=2, extreme=1
-    bill = recordItemDrop(bill, 'kettle', 1, tuning); // +300
+    bill = recordItemDrop(bill, 'perfume', 3, tuning, true); // +110 damaged
 
-    expect(bill.totalScore).toBe(10 + 60 + 240 + 300);
-    expect(bill.counts).toEqual({ tissue: 1, pen: 1, mug: 1, kettle: 1 });
+    expect(bill.totalScore).toBe(10 + 60 + 240 + 110);
+    expect(bill.counts.tissue).toBe(1);
+    expect(bill.counts.perfume).toBe(1);
     expect(bill.teeterDrops).toBe(2);
     expect(bill.extremeTeeterDrops).toBe(1);
+    expect(bill.damagedDrops).toBe(1);
     expect(bill.records).toHaveLength(4);
   });
 });
