@@ -22,6 +22,8 @@ export interface ProgressionState {
   readonly equippedSkin: CatSkinId;
   readonly codex: Record<ItemKind, CodexItemRecord>;
   readonly codexMasterClaimed: boolean;
+  readonly versusWins: number;
+  readonly blameShiftCount: number;
 }
 
 export interface EffectiveStats {
@@ -40,6 +42,7 @@ export interface CanCoinsInput {
   readonly passedStory: boolean;
   readonly stars: 0 | 1 | 2 | 3;
   readonly difficulty: DifficultyMode;
+  readonly versusWin?: boolean;
 }
 
 const DIFFICULTY_COIN_MULTIPLIER: Record<DifficultyMode, number> = {
@@ -69,6 +72,8 @@ export function createInitialProgression(): ProgressionState {
     equippedSkin: 'orange',
     codex: createInitialCodex(),
     codexMasterClaimed: false,
+    versusWins: 0,
+    blameShiftCount: 0,
   };
 }
 
@@ -77,17 +82,18 @@ export function createInitialProgression(): ProgressionState {
  * - 未推落任何物品或赔偿为 0 时得 0 币；
  * - 有赔偿时基础币 = Math.max(1, Math.floor(totalScore / 10))；
  * - 闯关成功 +15 币，三星额外 +15 币；
- * - 再乘以难度倍率（easy 1.0 / normal 1.25 / hard 1.6）。
+ * - 再乘以难度倍率（easy 1.0 / normal 1.25 / hard 1.6），双猫胜出额外 +40 币。
  */
 export function calculateCanCoinsReward(input: CanCoinsInput): number {
+  const winBonus = input.versusWin ? 40 : 0;
   if (input.totalScore <= 0 || input.dropCount <= 0) {
-    return 0;
+    return winBonus;
   }
   const baseCoins = Math.max(1, Math.floor(input.totalScore / 10));
   const passBonus = input.passedStory ? 15 : 0;
   const starBonus = input.passedStory && input.stars === 3 ? 15 : 0;
   const mult = DIFFICULTY_COIN_MULTIPLIER[input.difficulty];
-  return Math.max(1, Math.round((baseCoins + passBonus + starBonus) * mult));
+  return Math.max(1, Math.round((baseCoins + passBonus + starBonus) * mult)) + winBonus;
 }
 
 export function getUpgradeCost(upgradeId: UpgradeId, currentLevel: 0 | 1 | 2 | 3): number | null {
@@ -278,5 +284,15 @@ export function sanitizeProgression(raw: unknown): ProgressionState {
     equippedSkin,
     codex,
     codexMasterClaimed: Boolean(obj.codexMasterClaimed),
+    versusWins:
+      typeof obj.versusWins === 'number' && Number.isFinite(obj.versusWins) && obj.versusWins > 0
+        ? Math.floor(obj.versusWins)
+        : 0,
+    blameShiftCount:
+      typeof obj.blameShiftCount === 'number' &&
+      Number.isFinite(obj.blameShiftCount) &&
+      obj.blameShiftCount > 0
+        ? Math.floor(obj.blameShiftCount)
+        : 0,
   };
 }

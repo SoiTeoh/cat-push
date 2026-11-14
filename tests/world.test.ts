@@ -139,4 +139,100 @@ describe('CatPushWorld + Steward Integration (Regression Guards)', () => {
     expect(mug.multiplier).toBe(1);
     expect(mug.teeterTier).toBe('safe');
   });
+
+  it('initializes rival cat in versusMode and assigns lastTouchedBy on player push', () => {
+    const world = new CatPushWorld(tuning, ['tissue'], true);
+    expect(world.versusMode).toBe(true);
+    const tissue = world.items[0];
+    expect(tissue.lastTouchedBy).toBeNull();
+
+    // Move player cat right next to tissue and tap (rival far away on the left)
+    world.rival.x = 46;
+    world.cat.x = tissue.body.position.x - tissue.spec.width * 0.5 - 12;
+    world.step(1, true, false, 16, 'normal', undefined, undefined, 'RELAXED');
+    expect(tissue.lastTouchedBy).toBe('player');
+    expect(tissue.lastTouchedAgeSec).toBeCloseTo(0.016, 3);
+  });
+
+  it('detects interceptedRival when player steals a rival-owned teetering item and angers rival', () => {
+    const world = new CatPushWorld(tuning, ['mug'], true);
+    const mug = world.items[0];
+    Matter.Body.setPosition(mug.body, {
+      x: tuning.scene.tableEdgeX - 8,
+      y: tuning.scene.tableTopY - mug.spec.height / 2 - 0.1,
+    });
+    Matter.Body.setAngle(mug.body, 0.25);
+    mug.multiplier = 2;
+    mug.lastTouchedBy = 'rival';
+    mug.lastTouchedAgeSec = 0.2;
+
+    world.cat.x = mug.body.position.x - mug.spec.width * 0.5 - 12;
+    const res = world.step(1, true, false, 16, 'normal', undefined, undefined, 'RELAXED');
+    expect(res.interceptedRival).toBe(true);
+    expect(mug.lastTouchedBy).toBe('player');
+    expect(world.rival.angrySec).toBeGreaterThan(0.5);
+  });
+
+  it('allows player to jump over rival cat without horizontal blocking and freezes rival when stunned', () => {
+    const world = new CatPushWorld(tuning, ['tissue'], true);
+    world.rival.x = 120;
+    world.rival.stunSec = 2.0;
+    const beforeRivalX = world.rival.x;
+
+    world.cat.x = 96;
+    world.step(1, false, true, 16, 'normal', undefined, undefined, 'RELAXED');
+    for (let i = 0; i < 12; i++) {
+      world.step(1, false, false, 16, 'normal', undefined, undefined, 'RELAXED');
+    }
+    expect(world.rival.x).toBe(beforeRivalX);
+    expect(world.cat.x).toBeGreaterThan(120);
+  });
+
+  it('bounces rival behind player to the left on tap shove and blocks tap-stunned rival from claiming items', () => {
+    const world = new CatPushWorld(tuning, ['tissue'], true);
+    const tissue = world.items[0];
+    world.cat.x = 140;
+    world.rival.x = 160; // rival is in front (right) of player
+
+    const res = world.step(1, true, false, 16, 'normal', undefined, undefined, 'RELAXED');
+    expect(res.shovedRival).toBe(true);
+    expect(world.rival.x).toBeLessThan(world.cat.x);
+    expect(world.rival.tapStunSec).toBeCloseTo(1.0, 2);
+
+    // While tap-stunned, rival touching/near an item cannot overwrite player ownership
+    tissue.lastTouchedBy = 'player';
+    tissue.lastTouchedAgeSec = 0.2;
+    world.rival.x = tissue.body.position.x - tissue.spec.width * 0.5 - 10;
+    world.step(0, false, false, 16, 'normal', undefined, undefined, 'RELAXED');
+    expect(tissue.lastTouchedBy).toBe('player');
+  });
+
+  it('locks lastTouchedBy once item crosses tableEdgeX - 4 so falling contact cannot steal score', () => {
+    const world = new CatPushWorld(tuning, ['mug'], true);
+    const mug = world.items[0];
+    mug.lastTouchedBy = 'player';
+    mug.lastTouchedAgeSec = 0.2;
+    Matter.Body.setPosition(mug.body, {
+      x: tuning.scene.tableEdgeX - 2,
+      y: tuning.scene.tableTopY - mug.spec.height / 2,
+    });
+    world.cat.x = 60;
+    world.rival.x = mug.body.position.x - mug.spec.width * 0.5 - 10;
+
+    world.step(0, false, false, 16, 'normal', undefined, undefined, 'RELAXED');
+    expect(mug.lastTouchedBy).toBe('player');
+  });
+
+  it('steals ownership and triggers interceptedRival even on non-teetering rival-owned items', () => {
+    const world = new CatPushWorld(tuning, ['tissue'], true);
+    const tissue = world.items[0];
+    tissue.lastTouchedBy = 'rival';
+    tissue.lastTouchedAgeSec = 0.3;
+    world.rival.x = 46;
+    world.cat.x = tissue.body.position.x - tissue.spec.width * 0.5 - 12;
+
+    const res = world.step(1, true, false, 16, 'normal', undefined, undefined, 'RELAXED');
+    expect(res.interceptedRival).toBe(true);
+    expect(tissue.lastTouchedBy).toBe('player');
+  });
 });

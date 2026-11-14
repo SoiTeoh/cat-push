@@ -8,16 +8,24 @@ import {
   calculateDropScore,
   computeRelaxedInterval,
   computeRestoredX,
+  computeRivalWarningReactionSec,
   createBillSummary,
   createInitialProgress,
   createStewardState,
+  decideRivalAction,
   evaluateStageStars,
   evaluateTeeterState,
+  evaluateVersusOutcome,
+  evaluateVersusResult,
+  evaluateVersusWatch,
   formatRestoreText,
   formatTeeterSuspicionText,
   isFragileBrokenOnTable,
+  isItemOwnershipLocked,
   pickRestoreTarget,
   recordItemDrop,
+  resolveCatGroundSeparation,
+  resolveDropOwner,
   shouldAdvanceSimulation,
   shouldBlockCatHorizontally,
   stepCatJump,
@@ -26,6 +34,7 @@ import {
   triggerMeowCharm,
   type StewardState,
 } from '../src/game/rules';
+import { calculateCanCoinsReward, sanitizeProgression } from '../src/game/progression';
 
 const DEG = Math.PI / 180;
 
@@ -819,5 +828,311 @@ describe('3-Tier Difficulty Mode & Restore Rebalance (Phase A+)', () => {
     expect(steward.hearts).toBe(tuning.steward.maxHearts);
     expect(bill.totalScore).toBe(0);
     expect(bill.records).toHaveLength(0);
+  });
+});
+
+describe('Versus Mode & Blame Shift (Phase B2)', () => {
+  it('resolves drop owner to lastTouchedBy within touchExpirySec and defaults to player', () => {
+    expect(resolveDropOwner('rival', 1.0, 2.5)).toBe('rival');
+    expect(resolveDropOwner('player', 2.4, 2.5)).toBe('player');
+    expect(resolveDropOwner('rival', 2.6, 2.5)).toBe('player');
+    expect(resolveDropOwner(null, 0, 2.5)).toBe('player');
+  });
+
+  it('rival AI freezes when stunned and naps during WATCHING or after WARNING reaction', () => {
+    const items = [{ id: 1, x: 240, width: 32, baseScore: 60, dropped: false }];
+    const stunned = decideRivalAction({
+      rivalX: 120,
+      rivalStunSec: 1.8,
+      stewardPhase: 'RELAXED',
+      reactionTimerSec: 0,
+      tapCooldownSec: 0,
+      tableEdgeX: 300,
+      pawReach: 34,
+      items,
+    });
+    expect(stunned.stunned).toBe(true);
+    expect(stunned.moveDir).toBe(0);
+
+    const watching = decideRivalAction({
+      rivalX: 120,
+      rivalStunSec: 0,
+      stewardPhase: 'WATCHING',
+      reactionTimerSec: 0,
+      tapCooldownSec: 0,
+      tableEdgeX: 300,
+      pawReach: 34,
+      items,
+    });
+    expect(watching.napping).toBe(true);
+    expect(watching.moveDir).toBe(0);
+
+    const warningSlow = decideRivalAction({
+      rivalX: 120,
+      rivalStunSec: 0,
+      stewardPhase: 'WARNING',
+      reactionTimerSec: 0.3,
+      tapCooldownSec: 0,
+      tableEdgeX: 300,
+      pawReach: 34,
+      items,
+    });
+    expect(warningSlow.napping).toBe(false);
+    expect(warningSlow.moveDir).toBe(1);
+  });
+
+  it('rival AI prioritizes higher-score / edge-close items and taps near edge', () => {
+    const items = [
+      { id: 1, x: 140, width: 30, baseScore: 25, dropped: false },
+      { id: 2, x: 255, width: 36, baseScore: 120, dropped: false },
+    ];
+    const far = decideRivalAction({
+      rivalX: 90,
+      rivalStunSec: 0,
+      stewardPhase: 'RELAXED',
+      reactionTimerSec: 0,
+      tapCooldownSec: 0,
+      tableEdgeX: 300,
+      pawReach: 34,
+      items,
+    });
+    expect(far.moveDir).toBe(1);
+    expect(far.tap).toBe(false);
+
+    // Near left edge of item #2 (255 - 18 = 237) -> rivalX = 210, paw = 244 (within 22px)
+    const near = decideRivalAction({
+      rivalX: 218,
+      rivalStunSec: 0,
+      stewardPhase: 'RELAXED',
+      reactionTimerSec: 0,
+      tapCooldownSec: 0,
+      tableEdgeX: 300,
+      pawReach: 34,
+      items,
+    });
+    expect(near.tap).toBe(true);
+  });
+
+  it('triggers Blame Shift when player naps cleanly and rival or rival-owned item violates WATCHING', () => {
+    const res1 = evaluateVersusWatch({
+      playerActive: false,
+      rivalActive: true,
+      movingOwners: [],
+      droppedOwners: [],
+      rivalStunSec: 0,
+    });
+    expect(res1.blameShifted).toBe(true);
+    expect(res1.playerCaught).toBe(false);
+
+    const res2 = evaluateVersusWatch({
+      playerActive: false,
+      rivalActive: false,
+      movingOwners: ['rival'],
+      droppedOwners: [],
+      rivalStunSec: 0,
+    });
+    expect(res2.blameShifted).toBe(true);
+    expect(res2.playerCaught).toBe(false);
+  });
+
+  it('catches player when player is active or player-owned item moves/drops during WATCHING', () => {
+    expect(
+      evaluateVersusWatch({
+        playerActive: true,
+        rivalActive: true,
+        movingOwners: ['rival'],
+        droppedOwners: [],
+        rivalStunSec: 0,
+      }),
+    ).toEqual({ playerCaught: true, blameShifted: false });
+
+    expect(
+      evaluateVersusWatch({
+        playerActive: false,
+        rivalActive: false,
+        movingOwners: ['player'],
+        droppedOwners: [],
+        rivalStunSec: 0,
+      }),
+    ).toEqual({ playerCaught: true, blameShifted: false });
+
+    expect(
+      evaluateVersusWatch({
+        playerActive: false,
+        rivalActive: false,
+        movingOwners: [],
+        droppedOwners: ['player'],
+        rivalStunSec: 0,
+      }),
+    ).toEqual({ playerCaught: true, blameShifted: false });
+  });
+
+  it('does not blame-shift a rival that is already stunned', () => {
+    const res = evaluateVersusWatch({
+      playerActive: false,
+      rivalActive: false,
+      movingOwners: ['rival'],
+      droppedOwners: [],
+      rivalStunSec: 1.5,
+    });
+    expect(res).toEqual({ playerCaught: false, blameShifted: false });
+  });
+
+  it('evaluates versus outcome (win / lose / tie) and awards +40 bonus canCoins on win', () => {
+    expect(evaluateVersusOutcome(240, 180)).toBe('win');
+    expect(evaluateVersusOutcome(150, 220)).toBe('lose');
+    expect(evaluateVersusOutcome(180, 180)).toBe('tie');
+
+    const base = calculateCanCoinsReward({
+      totalScore: 200,
+      dropCount: 4,
+      passedStory: false,
+      stars: 0,
+      difficulty: 'normal',
+      versusWin: false,
+    });
+    const win = calculateCanCoinsReward({
+      totalScore: 200,
+      dropCount: 4,
+      passedStory: false,
+      stars: 0,
+      difficulty: 'normal',
+      versusWin: true,
+    });
+    expect(win - base).toBe(tuning.versus.winBonusCoins);
+  });
+
+  it('sanitizes and persists versusWins and blameShiftCount in ProgressionState', () => {
+    const clean = sanitizeProgression({ versusWins: 5, blameShiftCount: 11, canCoins: 120 });
+    expect(clean.versusWins).toBe(5);
+    expect(clean.blameShiftCount).toBe(11);
+    const fallback = sanitizeProgression({ versusWins: -3, blameShiftCount: 'bad' });
+    expect(fallback.versusWins).toBe(0);
+    expect(fallback.blameShiftCount).toBe(0);
+  });
+
+  it('rival AI walks left when overshooting target item and returns idle when no items left', () => {
+    const resLeft = decideRivalAction({
+      rivalX: 250,
+      rivalStunSec: 0,
+      stewardPhase: 'RELAXED',
+      reactionTimerSec: 0,
+      tapCooldownSec: 0,
+      tableEdgeX: 300,
+      pawReach: 34,
+      items: [{ id: 1, x: 180, width: 30, baseScore: 40, dropped: false }],
+    });
+    expect(resLeft.moveDir).toBe(-1);
+
+    const resEmpty = decideRivalAction({
+      rivalX: 120,
+      rivalStunSec: 0,
+      stewardPhase: 'RELAXED',
+      reactionTimerSec: 0,
+      tapCooldownSec: 0,
+      tableEdgeX: 300,
+      pawReach: 34,
+      items: [{ id: 1, x: 180, width: 30, baseScore: 40, dropped: true }],
+    });
+    expect(resEmpty).toEqual({ moveDir: 0, tap: false, napping: false, stunned: false });
+  });
+
+  it('rival AI naps on CAUGHT phase and respects tapCooldownSec', () => {
+    const caught = decideRivalAction({
+      rivalX: 180,
+      rivalStunSec: 0,
+      stewardPhase: 'CAUGHT',
+      reactionTimerSec: 0,
+      tapCooldownSec: 0,
+      tableEdgeX: 300,
+      pawReach: 34,
+      items: [{ id: 1, x: 250, width: 30, baseScore: 60, dropped: false }],
+    });
+    expect(caught.napping).toBe(true);
+
+    const onCooldown = decideRivalAction({
+      rivalX: 218,
+      rivalStunSec: 0,
+      stewardPhase: 'RELAXED',
+      reactionTimerSec: 0,
+      tapCooldownSec: 0.4,
+      tableEdgeX: 300,
+      pawReach: 34,
+      items: [{ id: 2, x: 255, width: 36, baseScore: 120, dropped: false }],
+    });
+    expect(onCooldown.tap).toBe(false);
+  });
+
+  it('triggers Blame Shift when rival-owned item drops during WATCHING while player naps', () => {
+    const res = evaluateVersusWatch({
+      playerActive: false,
+      rivalActive: false,
+      movingOwners: [],
+      droppedOwners: ['rival'],
+      rivalStunSec: 0,
+    });
+    expect(res).toEqual({ playerCaught: false, blameShifted: true });
+  });
+
+  it('freezes rival AI decisions while game is paused (shouldAdvanceSimulation=false)', () => {
+    expect(shouldAdvanceSimulation('paused')).toBe(false);
+    let rivalStun = 2.0;
+    if (shouldAdvanceSimulation('paused')) {
+      rivalStun = Math.max(0, rivalStun - 0.5);
+    }
+    expect(rivalStun).toBe(2.0);
+  });
+
+  it('awards +40 versusWin coins even on hard difficulty', () => {
+    const lossCoins = calculateCanCoinsReward({
+      totalScore: 300,
+      dropCount: 5,
+      passedStory: false,
+      stars: 0,
+      difficulty: 'hard',
+      versusWin: false,
+    });
+    const winCoins = calculateCanCoinsReward({
+      totalScore: 300,
+      dropCount: 5,
+      passedStory: false,
+      stars: 0,
+      difficulty: 'hard',
+      versusWin: true,
+    });
+    expect(winCoins - lossCoins).toBe(40);
+  });
+
+  it('never marks caught-out (hearts_zero) as a versus win even if playerScore > rivalScore', () => {
+    const caughtWin = evaluateVersusResult(500, 120, 'hearts_zero');
+    expect(caughtWin.outcome).toBe('win');
+    expect(caughtWin.isWin).toBe(false);
+
+    const timeUpWin = evaluateVersusResult(500, 120, 'time_up');
+    expect(timeUpWin.outcome).toBe('win');
+    expect(timeUpWin.isWin).toBe(true);
+  });
+
+  it('adds greedy reaction delay when rival is pushing teeter or angry/shoved', () => {
+    const calm = computeRivalWarningReactionSec(0.45, 0.68, 0.48, false, () => 0.5);
+    const greedy = computeRivalWarningReactionSec(0.45, 0.68, 0.48, true, () => 0.5);
+    expect(greedy - calm).toBeCloseTo(0.48, 4);
+  });
+
+  it('enforces ground horizontal anti-overlap separation between player and rival', () => {
+    const sep = resolveCatGroundSeparation(120, 124, 46, 46, 290, 1);
+    expect(sep.jostled).toBe(true);
+    expect(Math.abs(sep.catX - sep.rivalX)).toBeGreaterThanOrEqual(45.9);
+
+    const far = resolveCatGroundSeparation(80, 180, 46, 46, 290, 0);
+    expect(far.jostled).toBe(false);
+    expect(far.catX).toBe(80);
+    expect(far.rivalX).toBe(180);
+  });
+
+  it('locks item ownership once item crosses tableEdgeX - 4 or drops below tableTopY + 12', () => {
+    expect(isItemOwnershipLocked(260, 400, 300, 420)).toBe(false);
+    expect(isItemOwnershipLocked(296, 420, 300, 420)).toBe(true);
+    expect(isItemOwnershipLocked(250, 435, 300, 420)).toBe(true);
   });
 });

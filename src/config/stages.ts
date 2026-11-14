@@ -1,7 +1,7 @@
 import type { ItemKind } from './tuning';
 
 export type StageId = 1 | 2 | 3 | 4;
-export type GameMode = 'story' | 'endless';
+export type GameMode = 'story' | 'endless' | 'versus';
 
 export interface StagePalette {
   readonly wallTop: string;

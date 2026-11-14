@@ -734,3 +734,210 @@ export function recordItemDrop(
     records: [...bill.records, { kind, multiplier, score, brokeOnTable }],
   };
 }
+
+export type CatActor = 'player' | 'rival';
+
+export function resolveDropOwner(
+  lastTouchedBy: CatActor | null,
+  lastTouchedAgeSec: number,
+  expirySec = tuning.versus.touchExpirySec,
+): CatActor {
+  if (lastTouchedBy !== null && lastTouchedAgeSec <= expirySec) {
+    return lastTouchedBy;
+  }
+  return 'player';
+}
+
+export interface RivalItemCandidate {
+  readonly id: number;
+  readonly x: number;
+  readonly width: number;
+  readonly baseScore: number;
+  readonly dropped: boolean;
+}
+
+export interface RivalDecisionInput {
+  readonly rivalX: number;
+  readonly rivalStunSec: number;
+  readonly stewardPhase: StewardPhase;
+  readonly reactionTimerSec: number;
+  readonly tapCooldownSec: number;
+  readonly tableEdgeX: number;
+  readonly pawReach: number;
+  readonly items: readonly RivalItemCandidate[];
+}
+
+export interface RivalDecision {
+  readonly moveDir: -1 | 0 | 1;
+  readonly tap: boolean;
+  readonly napping: boolean;
+  readonly stunned: boolean;
+}
+
+/**
+ * 傲娇白猫 AI 决策：
+ * - 眩晕罚站中完全静止；
+ * - 主人 WATCHING/CAUGHT 或 WARNING 反应延迟结束后收爪装睡；
+ * - 其余时间优先挑高分且靠近桌沿的物品向右推，并在贴近时偶尔轻拍。
+ */
+export function decideRivalAction(input: RivalDecisionInput): RivalDecision {
+  if (input.rivalStunSec > 0) {
+    return { moveDir: 0, tap: false, napping: false, stunned: true };
+  }
+  const shouldNap =
+    input.stewardPhase === 'WATCHING' ||
+    input.stewardPhase === 'CAUGHT' ||
+    (input.stewardPhase === 'WARNING' && input.reactionTimerSec <= 0);
+  if (shouldNap) {
+    return { moveDir: 0, tap: false, napping: true, stunned: false };
+  }
+
+  const activeItems = input.items.filter((it) => !it.dropped);
+  if (activeItems.length === 0) {
+    return { moveDir: 0, tap: false, napping: false, stunned: false };
+  }
+
+  let best = activeItems[0];
+  let bestScore = -Infinity;
+  for (const it of activeItems) {
+    const edgeBonus = (it.x / Math.max(1, input.tableEdgeX)) * 45;
+    const distPenalty = Math.abs(it.x - input.rivalX) * 0.12;
+    const score = it.baseScore + edgeBonus - distPenalty;
+    if (score > bestScore) {
+      bestScore = score;
+      best = it;
+    }
+  }
+
+  const leftEdge = best.x - best.width * 0.5;
+  const pushStopX = leftEdge - 20;
+  if (input.rivalX < pushStopX - 6) {
+    return { moveDir: 1, tap: false, napping: false, stunned: false };
+  }
+  if (input.rivalX > best.x + 4) {
+    return { moveDir: -1, tap: false, napping: false, stunned: false };
+  }
+  const closeToLeft = Math.abs(input.rivalX + input.pawReach - leftEdge) <= 22;
+  const shouldTap = closeToLeft && input.tapCooldownSec <= 0 && best.x >= input.tableEdgeX - 85;
+  return { moveDir: 1, tap: shouldTap, napping: false, stunned: false };
+}
+
+export interface VersusWatchInput {
+  readonly playerActive: boolean;
+  readonly rivalActive: boolean;
+  readonly movingOwners: readonly CatActor[];
+  readonly droppedOwners: readonly CatActor[];
+  readonly rivalStunSec: number;
+}
+
+export interface VersusWatchResult {
+  readonly playerCaught: boolean;
+  readonly blameShifted: boolean;
+}
+
+/**
+ * 双猫模式 WATCHING 抓包与甩锅判定：
+ * - 若玩家自身在动、或玩家最后触碰的物品仍在移动/掉落 -> 玩家被抓包；
+ * - 若玩家乖乖装睡且名下无物移动，而白猫未装睡或白猫触碰的物品正在移动/掉落 -> 甩锅成功！只罚白猫。
+ */
+export function evaluateVersusWatch(input: VersusWatchInput): VersusWatchResult {
+  const playerViolated =
+    input.playerActive ||
+    input.movingOwners.includes('player') ||
+    input.droppedOwners.includes('player');
+  if (playerViolated) {
+    return { playerCaught: true, blameShifted: false };
+  }
+
+  const rivalViolated =
+    input.rivalStunSec <= 0 &&
+    (input.rivalActive ||
+      input.movingOwners.includes('rival') ||
+      input.droppedOwners.includes('rival'));
+  if (rivalViolated) {
+    return { playerCaught: false, blameShifted: true };
+  }
+
+  return { playerCaught: false, blameShifted: false };
+}
+
+export type VersusOutcome = 'win' | 'lose' | 'tie';
+
+export function evaluateVersusOutcome(playerScore: number, rivalScore: number): VersusOutcome {
+  if (playerScore > rivalScore) return 'win';
+  if (playerScore < rivalScore) return 'lose';
+  return 'tie';
+}
+
+export function evaluateVersusResult(
+  playerScore: number,
+  rivalScore: number,
+  endReason: StewardState['endReason'],
+): { readonly outcome: VersusOutcome; readonly isWin: boolean } {
+  const outcome = evaluateVersusOutcome(playerScore, rivalScore);
+  return {
+    outcome,
+    isWin: endReason !== 'hearts_zero' && outcome === 'win',
+  };
+}
+
+/**
+ * 白猫在主人 WARNING 时的收爪犹豫延迟：
+ * 当白猫正在贪推悬边物或刚被玩家挤撞/轻拍干扰时，会额外犹豫 greedyBonusSec，更容易被抓包甩锅。
+ */
+export function computeRivalWarningReactionSec(
+  minSec: number,
+  maxSec: number,
+  greedyBonusSec: number,
+  pushingTeeterOrAngry: boolean,
+  rng: () => number = Math.random,
+): number {
+  const base = minSec + clamp(rng(), 0, 1) * Math.max(0, maxSec - minSec);
+  return base + (pushingTeeterOrAngry ? greedyBonusSec : 0);
+}
+
+/**
+ * 地面双猫防叠罗汉水平排斥：保证两猫中心距至少为 minSep。
+ */
+export function resolveCatGroundSeparation(
+  catX: number,
+  rivalX: number,
+  minSep: number,
+  minX: number,
+  maxX: number,
+  playerMoveDir: -1 | 0 | 1,
+): { readonly catX: number; readonly rivalX: number; readonly jostled: boolean } {
+  const dx = catX - rivalX;
+  const absDx = Math.abs(dx);
+  if (absDx >= minSep) {
+    return { catX, rivalX, jostled: false };
+  }
+  const sign = dx >= 0 ? 1 : -1;
+  const overlap = minSep - absDx;
+  const catRatio = playerMoveDir !== 0 ? 0.25 : 0.5;
+  const rivalRatio = 1 - catRatio;
+  let nextCatX = clamp(catX + sign * overlap * catRatio, minX, maxX);
+  let nextRivalX = clamp(rivalX - sign * overlap * rivalRatio, minX, maxX);
+  // 若其中一只贴边顶墙，把剩余重叠推给另一只
+  const remain = minSep - Math.abs(nextCatX - nextRivalX);
+  if (remain > 0.5) {
+    if (nextRivalX <= minX + 0.5 || nextRivalX >= maxX - 0.5) {
+      nextCatX = clamp(nextCatX + sign * remain, minX, maxX);
+    } else {
+      nextRivalX = clamp(nextRivalX - sign * remain, minX, maxX);
+    }
+  }
+  return { catX: nextCatX, rivalX: nextRivalX, jostled: true };
+}
+
+/**
+ * 物品重心已越过桌沿或已离开桌面进入下坠状态时，锁定当前得分归属，禁止任何下坠擦碰再改写。
+ */
+export function isItemOwnershipLocked(
+  itemX: number,
+  itemY: number,
+  tableEdgeX: number,
+  tableTopY: number,
+): boolean {
+  return itemX >= tableEdgeX - 4 || itemY > tableTopY + 12;
+}

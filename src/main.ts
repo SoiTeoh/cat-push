@@ -24,6 +24,8 @@ import {
   createInitialProgress,
   createStewardState,
   evaluateStageStars,
+  evaluateVersusOutcome,
+  evaluateVersusWatch,
   recordItemDrop,
   shouldAdvanceSimulation,
   stepSteward,
@@ -180,6 +182,10 @@ function main(): void {
   let selectedCodexKind: ItemKind = 'tissue';
   let lastEarnedCoins = 0;
   let newlyCompletedCodex = false;
+  let rivalBillScore = 0;
+  let roundBlameShifts = 0;
+  let blameToastText: string | null = null;
+  let blameToastSec = 0;
   let waveNumber = 1;
   const restoredThisWatch = new Set<number>();
 
@@ -192,6 +198,8 @@ function main(): void {
   let movePointerId: number | null = null;
   let movePointerSide: -1 | 0 | 1 = 0;
   let movePointerStartY = 0;
+  let dpadPointerId: number | null = null;
+  let dpadMoveDir: -1 | 0 | 1 = 0;
   const heldKeys = new Set<string>();
   let tapQueued = false;
   let jumpQueued = false;
@@ -232,6 +240,8 @@ function main(): void {
     movePointerActive = false;
     movePointerId = null;
     movePointerSide = 0;
+    dpadPointerId = null;
+    dpadMoveDir = 0;
     heldKeys.clear();
     tapQueued = false;
   }
@@ -244,11 +254,15 @@ function main(): void {
     sound.unlock();
     stageId = nextStageId;
     const items = activeStageItems();
-    world = new CatPushWorld(tuning, items);
+    world = new CatPushWorld(tuning, items, gameMode === 'versus');
     waveNumber = 1;
     world.spawnWave(waveNumber, items);
     steward = createStewardState(tuning, difficulty);
     bill = createBillSummary();
+    rivalBillScore = 0;
+    roundBlameShifts = 0;
+    blameToastText = null;
+    blameToastSec = 0;
     restoredThisWatch.clear();
     particles.length = 0;
     floats.length = 0;
@@ -261,10 +275,14 @@ function main(): void {
 
   function exitToTitle(): void {
     const items = activeStageItems();
-    world = new CatPushWorld(tuning, items);
+    world = new CatPushWorld(tuning, items, gameMode === 'versus');
     waveNumber = 1;
     steward = createStewardState(tuning, difficulty);
     bill = createBillSummary();
+    rivalBillScore = 0;
+    roundBlameShifts = 0;
+    blameToastText = null;
+    blameToastSec = 0;
     restoredThisWatch.clear();
     particles.length = 0;
     floats.length = 0;
@@ -293,12 +311,17 @@ function main(): void {
     clearInputs();
     let stars: 0 | 1 | 2 | 3 = 0;
     let passedStory = false;
+    let versusWin = false;
     if (gameMode === 'story') {
       const target = STAGES[stageId].targetScore;
       stars =
         endReason === 'hearts_zero' ? 0 : evaluateStageStars(bill.totalScore, target, steward.hearts);
       passedStory = stars > 0;
       progress = applyStageResult(progress, difficulty, stageId, bill.totalScore, stars);
+    } else if (gameMode === 'versus') {
+      versusWin =
+        endReason !== 'hearts_zero' && evaluateVersusOutcome(bill.totalScore, rivalBillScore) === 'win';
+      progress = applyEndlessResult(progress, difficulty, bill.totalScore);
     } else {
       progress = applyEndlessResult(progress, difficulty, bill.totalScore);
     }
@@ -309,10 +332,13 @@ function main(): void {
       passedStory,
       stars,
       difficulty,
+      versusWin,
     });
     progression = {
       ...progression,
       canCoins: progression.canCoins + lastEarnedCoins,
+      versusWins: progression.versusWins + (versusWin ? 1 : 0),
+      blameShiftCount: progression.blameShiftCount + roundBlameShifts,
     };
     const codexRes = recordCodexDrops(progression, bill.records);
     progression = codexRes.state;
@@ -356,21 +382,32 @@ function main(): void {
       });
     }
 
-    const prefix = brokeOnTable ? '提前摔碎 +¥' : '+¥';
-    const multLabel = !brokeOnTable && multiplier > 1 ? ` ×${multiplier}!` : '';
+    const prefix =
+      gameMode === 'versus'
+        ? brokeOnTable
+          ? '我方摔碎 +¥'
+          : '我方 +¥'
+        : brokeOnTable
+          ? '提前摔碎 +¥'
+          : '+¥';
+    const multLabel = !brokeOnTable && multiplier > 1 ? ` ×${multiplier}!` : gameMode === 'versus' ? '！' : '';
+    const floatY = Math.min(y - 16, tuning.scene.tableTopY + 15);
     floats.push({
-      x: Math.max(54, Math.min(tuning.view.width - 54, x)),
-      y: y - 16,
+      x: Math.max(66, Math.min(tuning.view.width - 66, x)),
+      y: floatY,
       text: `${prefix}${score}${multLabel}`,
-      color: brokeOnTable
-        ? '#f97316'
-        : multiplier === 3
-          ? '#dc2626'
-          : multiplier === 2
-            ? '#ea580c'
-            : '#15803d',
-      life: 1.1,
-      maxLife: 1.1,
+      color:
+        gameMode === 'versus'
+          ? '#fbbf24'
+          : brokeOnTable
+            ? '#f97316'
+            : multiplier === 3
+              ? '#dc2626'
+              : multiplier === 2
+                ? '#ea580c'
+                : '#15803d',
+      life: 1.15,
+      maxLife: 1.15,
     });
 
     if (kind === 'fishbowl') {
@@ -393,6 +430,9 @@ function main(): void {
     let dir = 0;
     if (heldKeys.has('KeyA') || heldKeys.has('ArrowLeft')) dir -= 1;
     if (heldKeys.has('KeyD') || heldKeys.has('ArrowRight')) dir += 1;
+    if (dir === 0 && dpadPointerId !== null) {
+      dir = dpadMoveDir;
+    }
     if (dir === 0 && movePointerActive) {
       dir = movePointerSide;
     }
@@ -406,14 +446,18 @@ function main(): void {
     const pt = toLogicalCoords(e.clientX, e.clientY);
 
     if (screenMode === 'title') {
-      // 双模式切换 (y: 128..158)
+      // 三模式切换 (y: 128..158)
       if (pt.y >= 128 && pt.y <= 158) {
-        if (pt.x >= 40 && pt.x <= 190) {
+        if (pt.x >= 36 && pt.x <= 136) {
           gameMode = 'story';
           return;
         }
-        if (pt.x >= 200 && pt.x <= 350) {
+        if (pt.x >= 146 && pt.x <= 246) {
           gameMode = 'endless';
+          return;
+        }
+        if (pt.x >= 256 && pt.x <= 356) {
+          gameMode = 'versus';
           return;
         }
       }
@@ -585,8 +629,21 @@ function main(): void {
       return;
     }
 
+    // 左下角双拇指方向钮：◀ / ▶
+    const { left: leftBtn, right: rightBtn, tap: tapBtn, jump: jumpBtn, meow: meowBtn } =
+      tuning.buttons;
+    if (Math.hypot(pt.x - leftBtn.x, pt.y - leftBtn.y) <= leftBtn.r + 8) {
+      dpadPointerId = e.pointerId;
+      dpadMoveDir = -1;
+      return;
+    }
+    if (Math.hypot(pt.x - rightBtn.x, pt.y - rightBtn.y) <= rightBtn.r + 8) {
+      dpadPointerId = e.pointerId;
+      dpadMoveDir = 1;
+      return;
+    }
+
     // 右下角 3 个独立多指触控技能钮：轻拍! / 跳 / 喵~
-    const { tap: tapBtn, jump: jumpBtn, meow: meowBtn } = tuning.buttons;
     if (Math.hypot(pt.x - tapBtn.x, pt.y - tapBtn.y) <= tapBtn.r + 6) {
       tapQueued = true;
       return;
@@ -624,6 +681,10 @@ function main(): void {
   }
 
   function onPointerUpOrCancel(e: PointerEvent): void {
+    if (dpadPointerId !== null && e.pointerId === dpadPointerId) {
+      dpadPointerId = null;
+      dpadMoveDir = 0;
+    }
     if (movePointerId !== null && e.pointerId !== movePointerId) return;
     movePointerActive = false;
     movePointerId = null;
@@ -719,6 +780,7 @@ function main(): void {
     }
 
     shakeMag = Math.max(0, shakeMag - 28 * dtSec);
+    blameToastSec = Math.max(0, blameToastSec - dtSec);
 
     if (!shouldAdvanceSimulation(screenMode)) return;
 
@@ -770,12 +832,46 @@ function main(): void {
       difficulty,
       restoredThisWatch,
       stats,
+      steward.phase,
     );
     if (worldRes.phoneBuzzed) {
       sound.playPhoneBuzz();
     }
+    if (worldRes.interceptedRival) {
+      floats.push({
+        x: world.cat.x,
+        y: tuning.scene.tableTopY - 68,
+        text: '⚡ 截胡！',
+        color: '#fbbf24',
+        life: 0.95,
+        maxLife: 0.95,
+      });
+    }
+    if (worldRes.shovedRival) {
+      floats.push({
+        x: world.rival.x,
+        y: tuning.scene.tableTopY - 58,
+        text: '💥 顶开!',
+        color: '#fb923c',
+        life: 0.85,
+        maxLife: 0.85,
+      });
+    }
 
     for (const drop of worldRes.droppedItems) {
+      if (drop.owner === 'rival' && gameMode === 'versus') {
+        rivalBillScore += drop.score;
+        sound.playCrash(drop.heavy);
+        floats.push({
+          x: Math.max(66, Math.min(tuning.view.width - 66, drop.x)),
+          y: Math.min(drop.y - 16, tuning.scene.tableTopY + 15),
+          text: `白猫 +¥${drop.score}`,
+          color: '#38bdf8',
+          life: 1.15,
+          maxLife: 1.15,
+        });
+        continue;
+      }
       bill = recordItemDrop(
         bill,
         drop.kind,
@@ -809,13 +905,55 @@ function main(): void {
     const enableTeeterSuspicion =
       gameMode === 'story' ? STAGES[stageId].enableTeeterSuspicion : waveNumber >= 2;
 
+    let effectivePlayerActive = playerActive;
+    let effectiveHasMovingItem = worldRes.hasMovingItem;
+    let effectiveItemDropped = worldRes.droppedItems.length > 0;
+
+    if (gameMode === 'versus' && steward.phase === 'WATCHING') {
+      const watchRes = evaluateVersusWatch({
+        playerActive,
+        rivalActive: worldRes.rivalActive,
+        movingOwners: worldRes.movingOwners,
+        droppedOwners: worldRes.droppedOwners,
+        rivalStunSec: world.rival.stunSec,
+      });
+      if (watchRes.blameShifted) {
+        world.rival.stunSec = tuning.versus.rivalStunSec;
+        rivalBillScore = Math.max(0, rivalBillScore - tuning.versus.blameDeduction);
+        roundBlameShifts += 1;
+        blameToastText = '🔥 甩锅成功！小白猫背锅 -¥80 罚站 2.5s！';
+        blameToastSec = 2.5;
+        sound.playMeow();
+        floats.push({
+          x: tuning.view.width / 2,
+          y: tuning.scene.tableTopY - 126,
+          text: '小白猫！又是你干的！',
+          color: '#dc2626',
+          life: 2.0,
+          maxLife: 2.0,
+        });
+        steward = {
+          ...steward,
+          phase: 'RELAXED',
+          phaseTimerSec: tuning.steward.watchMaxSec,
+        };
+        effectivePlayerActive = false;
+        effectiveHasMovingItem = false;
+        effectiveItemDropped = false;
+      } else if (!watchRes.playerCaught) {
+        effectivePlayerActive = false;
+        effectiveHasMovingItem = false;
+        effectiveItemDropped = false;
+      }
+    }
+
     steward = stepSteward(
       steward,
       {
         dtSec,
-        playerActive,
-        hasMovingItem: worldRes.hasMovingItem,
-        itemDroppedDuringStep: worldRes.droppedItems.length > 0,
+        playerActive: effectivePlayerActive,
+        hasMovingItem: effectiveHasMovingItem,
+        itemDroppedDuringStep: effectiveItemDropped,
         addedNoise: worldRes.addedNoise,
         hasTeeteringItem: worldRes.hasTeeteringItem,
         teeteringItemLabel: worldRes.teeteringItemLabel,
@@ -896,6 +1034,10 @@ function main(): void {
         particles,
         floats,
         animTimeSec,
+        rivalBillScore,
+        blameShiftCount: roundBlameShifts,
+        blameToastText,
+        blameToastSec,
       },
       tuning,
     );

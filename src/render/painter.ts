@@ -17,6 +17,7 @@ import {
 } from '../game/progression';
 import {
   clamp,
+  evaluateVersusResult,
   formatRestoreText,
   formatTeeterSuspicionText,
   type BillSummary,
@@ -66,6 +67,10 @@ export interface RenderExtra {
   readonly particles: readonly Particle[];
   readonly floats: readonly FloatingText[];
   readonly animTimeSec: number;
+  readonly rivalBillScore: number;
+  readonly blameShiftCount: number;
+  readonly blameToastText: string | null;
+  readonly blameToastSec: number;
 }
 
 export function drawGameFrame(
@@ -92,10 +97,15 @@ export function drawGameFrame(
   drawTable(ctx, width, tableTopY, tableEdgeX, tableThickness, floorY, stage);
   drawOriginBases(ctx, world.items, tableTopY);
 
+  // 3.5 傲娇白猫放在物品后层，避免白猫身体遮挡小道具
+  if (world.versusMode) {
+    drawRivalCat(ctx, world, extra.steward, tableTopY, extra.animTimeSec, t);
+  }
+
   // 4. 桌面物品
   for (const item of world.items) {
     if (item.dropped) continue;
-    drawItem(ctx, item, tableEdgeX, extra.animTimeSec);
+    drawItem(ctx, item, tableEdgeX, extra.animTimeSec, world.versusMode, t.versus.touchExpirySec);
   }
 
   // 4.5 主人“物归原位”伸手拉锯动画
@@ -106,11 +116,30 @@ export function drawGameFrame(
     }
   }
 
-  // 5. 手贱猫咪（支持 4 套皮肤，停靠物体外侧，仅前爪抵住左侧面推进）
+  // 5. 玩家手贱猫咪
   drawCat(ctx, world, extra.steward, tableTopY, extra.animTimeSec, extra.progression.equippedSkin);
 
   // 6. 碎裂粒子与飘字
   drawParticlesAndFloats(ctx, extra.particles, extra.floats);
+
+  if (extra.blameToastText && extra.blameToastSec > 0) {
+    ctx.save();
+    const alpha = Math.min(1, extra.blameToastSec * 2.2);
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = 'rgba(245, 158, 11, 0.94)';
+    ctx.beginPath();
+    ctx.roundRect(width / 2 - 142, 168, 284, 34, 17);
+    ctx.fill();
+    ctx.strokeStyle = '#fef3c7';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.fillStyle = '#2b241f';
+    ctx.font = 'bold 13.5px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(extra.blameToastText, width / 2, 185);
+    ctx.restore();
+  }
 
   // 7. 局内 HUD / 暂停 / 封面 / 商店 / 图鉴 / 结算卡
   if (extra.screenMode === 'playing') {
@@ -535,16 +564,34 @@ function drawItem(
   item: TableItem,
   _tableEdgeX: number,
   animTimeSec: number,
+  versusMode = false,
+  touchExpirySec = 2.5,
 ): void {
   const { body, kind, spec, teeterTier, multiplier } = item;
   const isTeeter = teeterTier !== 'safe';
   const hw = spec.width / 2;
   const hh = spec.height / 2;
+  const activeOwner =
+    versusMode && item.lastTouchedBy !== null && item.lastTouchedAgeSec <= touchExpirySec
+      ? item.lastTouchedBy
+      : null;
 
   ctx.save();
   const buzzDx = item.isBuzzing ? Math.sin(animTimeSec * 65) * 1.6 : 0;
   ctx.translate(body.position.x + buzzDx, body.position.y);
   ctx.rotate(body.angle);
+
+  if (activeOwner !== null) {
+    ctx.save();
+    ctx.strokeStyle = activeOwner === 'player' ? '#f59e0b' : '#38bdf8';
+    ctx.lineWidth = 3;
+    ctx.shadowColor = activeOwner === 'player' ? 'rgba(245, 158, 11, 0.7)' : 'rgba(56, 189, 248, 0.7)';
+    ctx.shadowBlur = 7;
+    ctx.beginPath();
+    ctx.roundRect(-hw - 3, -hh - 3, spec.width + 6, spec.height + 6, 6);
+    ctx.stroke();
+    ctx.restore();
+  }
 
   switch (kind) {
     case 'tissue': {
@@ -830,6 +877,25 @@ function drawItem(
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(multiplier === 3 ? '×3.0 极限' : '×2.0 悬边', body.position.x, labelY - 1);
+    ctx.restore();
+  }
+
+  // 双猫模式物品实时归属徽章（爪印 + 我/白）
+  if (activeOwner !== null) {
+    const badgeY = body.position.y - hh - (isTeeter ? 28 : 13);
+    ctx.save();
+    ctx.fillStyle = activeOwner === 'player' ? 'rgba(245, 158, 11, 0.95)' : 'rgba(14, 165, 233, 0.95)';
+    ctx.beginPath();
+    ctx.roundRect(body.position.x - 16, badgeY - 8, 32, 16, 8);
+    ctx.fill();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 9.5px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(activeOwner === 'player' ? '🐾我' : '🐾白', body.position.x, badgeY);
     ctx.restore();
   }
 }
@@ -1132,9 +1198,13 @@ function drawParticlesAndFloats(
   for (const f of floats) {
     ctx.save();
     ctx.globalAlpha = Math.max(0, f.life / f.maxLife);
-    ctx.fillStyle = f.color;
-    ctx.font = 'bold 15px system-ui, sans-serif';
+    ctx.font = 'bold 16px system-ui, sans-serif';
     ctx.textAlign = 'center';
+    ctx.lineWidth = 3.6;
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = 'rgba(24, 18, 15, 0.9)';
+    ctx.strokeText(f.text, f.x, f.y);
+    ctx.fillStyle = f.color;
     ctx.fillText(f.text, f.x, f.y);
     ctx.restore();
   }
@@ -1146,7 +1216,7 @@ function drawPlayingHud(
   extra: RenderExtra,
   t: Tuning,
 ): void {
-  const { width, height } = t.view;
+  const { width } = t.view;
   const { steward, bill, muted, gameMode, stageId } = extra;
   const stage = STAGES[stageId];
 
@@ -1221,8 +1291,47 @@ function drawPlayingHud(
         : '#fde68a';
   ctx.font = 'bold 11px system-ui, sans-serif';
   const badgeText =
-    gameMode === 'story' ? `${stage.shortName} · ${diffLabel}` : `无尽茶水间 · ${diffLabel}`;
+    gameMode === 'story'
+      ? `${stage.shortName} · ${diffLabel}`
+      : gameMode === 'versus'
+        ? `双猫甩锅 · ${diffLabel}`
+        : `无尽茶水间 · ${diffLabel}`;
   ctx.fillText(badgeText, 93, 78);
+
+  if (gameMode === 'versus') {
+    const barX = 176;
+    const barW = width - 192;
+    const totalBoth = bill.totalScore + extra.rivalBillScore;
+    const playerShare = totalBoth > 0 ? bill.totalScore / totalBoth : 0.5;
+    ctx.fillStyle = 'rgba(35, 30, 27, 0.84)';
+    ctx.beginPath();
+    ctx.roundRect(barX, 66, barW, 27, 10);
+    ctx.fill();
+    ctx.font = 'bold 11px system-ui, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#fbbf24';
+    ctx.fillText(`我 ¥${bill.totalScore}`, barX + 8, 76);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#38bdf8';
+    ctx.fillText(`白猫 ¥${extra.rivalBillScore}`, barX + barW - 8, 76);
+
+    // 双色对比进度条
+    const trackX = barX + 8;
+    const trackW = barW - 16;
+    const splitW = Math.max(4, Math.min(trackW - 4, trackW * playerShare));
+    ctx.fillStyle = '#38bdf8';
+    ctx.beginPath();
+    ctx.roundRect(trackX, 84, trackW, 4, 2);
+    ctx.fill();
+    ctx.fillStyle = '#f59e0b';
+    ctx.beginPath();
+    ctx.roundRect(trackX, 84, splitW, 4, 2);
+    ctx.fill();
+  }
+
+  // 左下角双拇指方向钮：◀ / ▶
+  drawDirectionCircleButton(ctx, t.buttons.left, '◀');
+  drawDirectionCircleButton(ctx, t.buttons.right, '▶');
 
   const effectiveMeowCd = getEffectiveStats(extra.progression).meowCooldownSec;
   // 右下角 3 个紧凑触屏技能钮：喵~ (E) / 跳 (W) / 轻拍! (Space)
@@ -1244,11 +1353,188 @@ function drawPlayingHud(
     '#e07040',
   );
 
-  // 底部极简操控提示
-  ctx.fillStyle = 'rgba(255, 247, 234, 0.78)';
-  ctx.font = '11px system-ui, sans-serif';
+  // 底部极简操控提示（放在按钮上方，不与左下 ◀/▶ 重叠）
+  ctx.fillStyle = 'rgba(255, 247, 234, 0.8)';
+  ctx.font = '10.5px system-ui, sans-serif';
   ctx.textAlign = 'left';
-  ctx.fillText('按住左/右推 · 松手装睡', 16, height - 16);
+  ctx.fillText('按住 ◀/▶ 或拖屏移动 · 松手装睡', 16, 528);
+
+  ctx.restore();
+}
+
+function drawDirectionCircleButton(
+  ctx: CanvasRenderingContext2D,
+  btn: { readonly x: number; readonly y: number; readonly r: number },
+  arrow: string,
+): void {
+  ctx.fillStyle = 'rgba(35, 30, 27, 0.72)';
+  ctx.beginPath();
+  ctx.arc(btn.x, btn.y, btn.r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255, 247, 234, 0.45)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  ctx.fillStyle = '#fff7ea';
+  ctx.font = 'bold 17px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(arrow, btn.x, btn.y + 1);
+}
+
+function drawRivalCat(
+  ctx: CanvasRenderingContext2D,
+  world: CatPushWorld,
+  steward: StewardState,
+  tableTopY: number,
+  animTimeSec: number,
+  t: Tuning,
+): void {
+  const rival = world.rival;
+  const stun = rival.stunSec > 0;
+  const tapStun = rival.tapStunSec > 0;
+  const anyStun = stun || tapStun;
+  const angry = rival.angrySec > 0;
+  const crouch = 1 - rival.alertness;
+  const arcOffset =
+    rival.shoveArcSec > 0 ? Math.sin((rival.shoveArcSec / 0.28) * Math.PI) * 24 : 0;
+  const bodyY = tableTopY - 17 + crouch * 5 - arcOffset;
+
+  ctx.save();
+  ctx.translate(rival.x, bodyY);
+
+  // 阴影
+  ctx.fillStyle = 'rgba(20, 14, 10, 0.2)';
+  ctx.beginPath();
+  ctx.ellipse(0, 17 - crouch * 5 + arcOffset, 22, 4.5, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // 蓬松白尾巴
+  const tailWag = Math.sin(animTimeSec * (rival.isActive ? 8 : 2.2)) * 5;
+  ctx.strokeStyle = '#f8fafc';
+  ctx.lineWidth = angry ? 8 : 6;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(-18, 5);
+  ctx.quadraticCurveTo(-30, -4 + tailWag, -27, -14 + tailWag * 0.5);
+  ctx.stroke();
+
+  // 圆润白猫身体
+  ctx.fillStyle = stun ? '#e2e8f0' : '#ffffff';
+  ctx.beginPath();
+  ctx.ellipse(-2, 4, 21, 14 - crouch * 3, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#cbd5e1';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // 头部
+  const headX = 12;
+  const headY = -8 + crouch * 4;
+  ctx.fillStyle = stun ? '#e2e8f0' : '#ffffff';
+  ctx.beginPath();
+  ctx.arc(headX, headY, 14, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  // 耳朵（内耳粉）
+  for (const ex of [-7, 5]) {
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.moveTo(headX + ex - 4, headY - 9);
+    ctx.lineTo(headX + ex, headY - 21);
+    ctx.lineTo(headX + ex + 5, headY - 10);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = '#fda4af';
+    ctx.beginPath();
+    ctx.moveTo(headX + ex - 2, headY - 10);
+    ctx.lineTo(headX + ex, headY - 17);
+    ctx.lineTo(headX + ex + 3, headY - 11);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // 表情：罚站晕厥 @ _ @ | 炸毛 > д < | 平时傲娇 - ʌ -
+  ctx.fillStyle = '#334155';
+  ctx.font = 'bold 9.5px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  if (anyStun) {
+    ctx.fillText(tapStun && !stun ? '> д <' : '@ _ @', headX + 2, headY - 1);
+    // 头顶旋转金星
+    for (let i = 0; i < 3; i++) {
+      const a = animTimeSec * 5 + (i * Math.PI * 2) / 3;
+      const sx = headX + Math.cos(a) * 14;
+      const sy = headY - 22 + Math.sin(a) * 4;
+      ctx.fillStyle = '#f59e0b';
+      ctx.font = '10px system-ui, sans-serif';
+      ctx.fillText('★', sx, sy);
+    }
+    if (stun) {
+      ctx.fillStyle = '#dc2626';
+      ctx.font = 'bold 10px system-ui, sans-serif';
+      ctx.fillText(`罚站 ${rival.stunSec.toFixed(1)}s`, headX, headY - 32);
+    }
+  } else if (angry) {
+    ctx.fillText('> д <', headX + 2, headY - 1);
+  } else if (crouch > 0.65) {
+    ctx.fillText('- ʌ -', headX + 2, headY);
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = 'bold 10px system-ui, sans-serif';
+    ctx.fillText('zZ', headX + 16, headY - 16);
+  } else {
+    ctx.fillText('- ʌ -', headX + 2, headY - 1);
+  }
+
+  // 粉色小鼻子
+  ctx.fillStyle = '#fb7185';
+  ctx.beginPath();
+  ctx.arc(headX + 5, headY + 3, 2, 0, Math.PI * 2);
+  ctx.fill();
+
+  // 前爪推物动画
+  if (rival.pawExtend > 0.05 && !anyStun) {
+    ctx.fillStyle = '#ffffff';
+    ctx.strokeStyle = '#cbd5e1';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.ellipse(22 + rival.pawExtend * 11, 2, 7, 4.5, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  }
+
+  // 可甩锅闪烁提示：当主人冒 ? 或 盯 时，白猫未收爪或名下物品仍在滑向桌沿
+  if (
+    !anyStun &&
+    (steward.phase === 'WARNING' || steward.phase === 'WATCHING') &&
+    (rival.isActive ||
+      world.items.some(
+        (it) =>
+          !it.dropped &&
+          it.lastTouchedBy === 'rival' &&
+          it.lastTouchedAgeSec <= t.versus.touchExpirySec &&
+          Math.hypot(it.body.velocity.x, it.body.velocity.y) > t.steward.motionSpeedThreshold,
+      ))
+  ) {
+    const pulse = 0.72 + Math.sin(animTimeSec * 16) * 0.28;
+    ctx.save();
+    ctx.globalAlpha = pulse;
+    ctx.fillStyle = '#f59e0b';
+    ctx.beginPath();
+    ctx.roundRect(headX - 54, headY - 46, 108, 19, 9);
+    ctx.fill();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+    ctx.fillStyle = '#2b241f';
+    ctx.font = 'bold 10.5px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('⚠ 快装睡甩锅！', headX, headY - 36);
+    ctx.restore();
+  }
 
   ctx.restore();
 }
@@ -1332,20 +1618,21 @@ function drawTitleOverlay(
   ctx.font = 'bold 22px system-ui, sans-serif';
   ctx.fillText('把东西推下桌！', width / 2, 110);
 
-  // 双模式切换开关 (y: 128..158)
+  // 三模式切换开关 (y: 128..158)
   const modes: Array<{ id: GameMode; label: string; x: number }> = [
-    { id: 'story', label: '闯关捣蛋 (4关)', x: 40 },
-    { id: 'endless', label: '无尽茶水间', x: 200 },
+    { id: 'story', label: '闯关捣蛋', x: 36 },
+    { id: 'endless', label: '无尽茶水间', x: 146 },
+    { id: 'versus', label: '双猫甩锅', x: 256 },
   ];
   for (const m of modes) {
     const active = gameMode === m.id;
     ctx.fillStyle = active ? '#e07040' : '#efe5d8';
     ctx.beginPath();
-    ctx.roundRect(m.x, 128, 150, 30, 12);
+    ctx.roundRect(m.x, 128, 100, 30, 11);
     ctx.fill();
     ctx.fillStyle = active ? '#ffffff' : '#5e534a';
-    ctx.font = 'bold 13px system-ui, sans-serif';
-    ctx.fillText(m.label, m.x + 75, 147);
+    ctx.font = 'bold 12px system-ui, sans-serif';
+    ctx.fillText(m.label, m.x + 50, 147);
   }
 
   // 3 档难度分段切换开关 (y: 168..196)
@@ -1407,6 +1694,19 @@ function drawTitleOverlay(
     ctx.fillText(cur.subtitle, width / 2, 334);
     ctx.fillText('趁主人分心/背对推向桌沿，冒「?」立刻松手装睡！', width / 2, 362);
     ctx.fillText('悬边摇晃(×2/×3)再推落翻倍，高重心香水别桌上摔碎', width / 2, 386);
+  } else if (gameMode === 'versus') {
+    ctx.fillStyle = '#5e534a';
+    ctx.font = '13px system-ui, sans-serif';
+    const lines = [
+      '60 秒双猫同桌抢推对抗！',
+      '截胡白猫悬边物品直接抢分，可用跳(W)跨越白猫',
+      '冒「?」提前装睡甩锅：白猫罚站 2.5s 并扣 ¥80！',
+      `累计胜场：${progression.versusWins} 场 · 成功甩锅：${progression.blameShiftCount} 次`,
+    ];
+    lines.forEach((line, idx) => {
+      ctx.fillStyle = idx === 3 ? '#d97706' : '#5e534a';
+      ctx.fillText(line, width / 2, 254 + idx * 32);
+    });
   } else {
     ctx.fillStyle = '#5e534a';
     ctx.font = '13.5px system-ui, sans-serif';
@@ -1815,21 +2115,53 @@ function drawResultOverlay(
   const caughtOut = steward.endReason === 'hearts_zero';
   const passedStory =
     gameMode === 'story' && !caughtOut && bill.totalScore >= stage.targetScore;
-  ctx.fillStyle = caughtOut ? '#d63031' : passedStory ? '#059669' : '#e07040';
-  ctx.font = 'bold 21px system-ui, sans-serif';
+  const versusRes =
+    gameMode === 'versus'
+      ? evaluateVersusResult(bill.totalScore, extra.rivalBillScore, steward.endReason)
+      : null;
+  const versusWin = Boolean(versusRes?.isWin);
+  const cardSafeMaxW = width - 88; // 卡片左右各留 >= 20px 安全边距
+  ctx.fillStyle = caughtOut
+    ? '#d63031'
+    : passedStory || versusWin
+      ? '#059669'
+      : '#e07040';
   ctx.textAlign = 'center';
   const title = caughtOut
     ? '被当场抓包！'
-    : gameMode === 'story'
-      ? passedStory
-        ? `${stage.shortName} 通关成功！`
-        : '目标金额未达成'
-      : '60 秒捣蛋结算';
-  ctx.fillText(`${title} [${diffLabel}]`, width / 2, 124);
+    : gameMode === 'versus'
+      ? versusRes?.outcome === 'win'
+        ? '完胜傲娇白猫！'
+        : versusRes?.outcome === 'tie'
+          ? '双猫打成平手！'
+          : '惜败！白猫领先'
+      : gameMode === 'story'
+        ? passedStory
+          ? `${stage.shortName} 通关成功！`
+          : '目标金额未达成'
+        : '60 秒捣蛋结算';
+  drawFittedCenteredText(
+    ctx,
+    `${title} [${diffLabel}]`,
+    width / 2,
+    124,
+    cardSafeMaxW,
+    gameMode === 'versus' ? 18 : 20,
+  );
 
   ctx.fillStyle = '#2b241f';
-  ctx.font = 'bold 34px system-ui, sans-serif';
-  ctx.fillText(`赔偿 ¥${bill.totalScore}`, width / 2, 170);
+  const scoreHeadline =
+    gameMode === 'versus'
+      ? `我方 ¥${bill.totalScore} vs 白猫 ¥${extra.rivalBillScore}`
+      : `赔偿 ¥${bill.totalScore}`;
+  drawFittedCenteredText(
+    ctx,
+    scoreHeadline,
+    width / 2,
+    170,
+    cardSafeMaxW,
+    gameMode === 'versus' ? 23 : 32,
+  );
 
   if (gameMode === 'story') {
     const stars = diffProgress.stars[stageId];
@@ -1854,18 +2186,32 @@ function drawResultOverlay(
   ctx.fillStyle = '#6c5f55';
   ctx.font = '13px system-ui, sans-serif';
   const totalDropped = bill.records.length;
-  const rows = [
-    `共推落物品：${totalDropped} 件`,
-    `悬边挑衅成功：${bill.teeterDrops} 次（极限 ×3 共 ${bill.extremeTeeterDrops} 次）`,
-    bill.damagedDrops > 0
-      ? `桌上提前摔碎折损：${bill.damagedDrops} 件（仅得半价）`
-      : `剩余忍耐红心：${steward.hearts} / 3`,
-    newlyCompletedCodex
-      ? `🎉 图鉴 15/15 全收集！+100 罐头币 · ${CODEX_MASTER_BADGE_NAME}`
-      : gameMode === 'story'
-        ? `本关目标：¥${stage.targetScore} · 最高 ¥${diffProgress.bestScores[stageId]}`
-        : `无尽最高赔偿：¥${diffProgress.endlessBestScore}`,
-  ];
+  const rows =
+    gameMode === 'versus'
+      ? [
+          `我方推落：${totalDropped} 件 · 成功甩锅：${extra.blameShiftCount} 次`,
+          `悬边挑衅成功：${bill.teeterDrops} 次（极限 ×3 共 ${bill.extremeTeeterDrops} 次）`,
+          versusWin
+            ? `胜场奖励：已额外发放 +${tuning.versus.winBonusCoins} 罐头币！`
+            : caughtOut
+              ? '被抓包淘汰 · 无法领取胜场奖励'
+              : `剩余忍耐红心：${steward.hearts} / 3`,
+          newlyCompletedCodex
+            ? `🎉 图鉴 15/15 全收集！+100 罐头币 · ${CODEX_MASTER_BADGE_NAME}`
+            : `累计胜场：${progression.versusWins} 场 · 累计甩锅：${progression.blameShiftCount} 次`,
+        ]
+      : [
+          `共推落物品：${totalDropped} 件`,
+          `悬边挑衅成功：${bill.teeterDrops} 次（极限 ×3 共 ${bill.extremeTeeterDrops} 次）`,
+          bill.damagedDrops > 0
+            ? `桌上提前摔碎折损：${bill.damagedDrops} 件（仅得半价）`
+            : `剩余忍耐红心：${steward.hearts} / 3`,
+          newlyCompletedCodex
+            ? `🎉 图鉴 15/15 全收集！+100 罐头币 · ${CODEX_MASTER_BADGE_NAME}`
+            : gameMode === 'story'
+              ? `本关目标：¥${stage.targetScore} · 最高 ¥${diffProgress.bestScores[stageId]}`
+              : `无尽最高赔偿：¥${diffProgress.endlessBestScore}`,
+        ];
   rows.forEach((row, i) => {
     ctx.fillStyle = newlyCompletedCodex && i === 3 ? '#d97706' : '#6c5f55';
     ctx.fillText(row, width / 2, 272 + i * 28);
@@ -1923,6 +2269,23 @@ function drawResultOverlay(
   }
 
   ctx.restore();
+}
+
+function drawFittedCenteredText(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  centerX: number,
+  y: number,
+  maxWidth: number,
+  basePx: number,
+): void {
+  let fontPx = basePx;
+  ctx.font = `bold ${fontPx}px system-ui, sans-serif`;
+  while (fontPx > 12 && ctx.measureText(text).width > maxWidth) {
+    fontPx -= 1;
+    ctx.font = `bold ${fontPx}px system-ui, sans-serif`;
+  }
+  ctx.fillText(text, centerX, y);
 }
 
 function drawDebugOverlay(

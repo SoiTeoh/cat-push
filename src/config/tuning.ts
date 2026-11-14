@@ -91,9 +91,28 @@ export const tuning = {
     meowCharmDurationSec: 1.8,
   },
   buttons: {
+    left: { x: 42, y: 572, r: 26 },
+    right: { x: 106, y: 572, r: 26 },
     tap: { x: 344, y: 566, r: 28 },
     jump: { x: 280, y: 572, r: 24 },
     meow: { x: 220, y: 572, r: 24 },
+  },
+  versus: {
+    blameDeduction: 80,
+    rivalStunSec: 2.5,
+    rivalReactionMinSec: 0.45,
+    rivalReactionMaxSec: 0.68,
+    greedyReactionBonusSec: 0.48,
+    shoveImpulsePx: 38,
+    shoveRangePx: 72,
+    rivalSpeedByDifficulty: {
+      easy: 0.62,
+      normal: 0.78,
+      hard: 0.94,
+    },
+    rivalHeavySpeedMult: 0.68,
+    touchExpirySec: 2.5,
+    winBonusCoins: 40,
   },
   teeter: {
     /** 质心距离桌沿在此范围内且倾角大于 minTiltDeg 即触发悬边 */
