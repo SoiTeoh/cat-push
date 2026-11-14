@@ -7,10 +7,21 @@
 
 ## 2. 当前开发阶段
 
-- **V2.0 Phase A+（3 档难度分层 + 亲民化平衡定稿）已完成本地开发、全量验证并推送至 `origin/main` 封存**。
-- **Phase B（罐头币商店、图鉴、双猫抢推竞争模式）已暂缓/搁置**：待评估 Phase A+ 实机反馈后决定是否开启。
+- **V2.0 Phase B1（罐头币成长商店 + 4 套猫咪皮肤 + 15 物捣蛋破坏图鉴 + 局内暂停与结算回主页）已完成全量验证并推送至 `origin/main` 封存**。
+- **Phase B2（双猫抢推竞争模式）已规划待后续专项推进**。
 
-## 3. 已实现功能（V2.0 Phase A / A+）
+## 3. 已实现功能（V2.0 Phase B1 新增）
+
+1. **罐头币钱包（`canCoins`）与局外结算**：
+   - 每局结算按 `Math.max(1, Math.floor(totalScore / 10))`（`totalScore > 0` 保底 1 币）+ 通关 `+15` + 三星 `+15` × 难度倍率（`easy 1.0` / `normal 1.25` / `hard 1.6`）稳定发放罐头币。
+   - 结算卡高亮展示 `本局获得 +XX 罐头币（当前余额 🪙 XXX）`。
+2. **猫咪成长商店（`[能力进阶]` / `[猫咪皮肤]`）**：
+   - **4 维能力升级**（`Lv.0 -> Lv.3`，阶梯价格 `30 / 70 / 130`）：`大力金刚爪`（`+12%/+24%/+38%` 推力与轻拍）、`奥斯卡演技`（`+0.10s/+0.20s/+0.30s` `?` 预警）、`无影肉垫`（`-14%/-26%/-38%` 摩擦噪声）、`猫语十级`（`喵~` 冷却 `9.0s -> 7.8s -> 6.6s -> 5.5s`）。
+   - **4 套猫咪外观皮肤**：`肥橘猫`（默认）、`奶牛拆家猫`（80 币，悬边 `×2/×3` 额外 `+10%` 赔偿）、`挖煤暹罗猫`（140 币，`喵~` 打断 `+0.3s`）、`黑猫战神`（220 币，重物推速 `+10%`），局内 Canvas 矢量绘制实时生效。
+3. **15 物捣蛋破坏图鉴（`3列 × 5行`）**：
+   - 记录全部 15 件道具的解锁状态、已摔碎次数、最高倍率与专属幽默吐槽文案，未解锁显示提示线索。
+   - 达成 `15/15` 全收集时一次性奖励 `+100` 罐头币与「全屋碎裂大师」徽章。
+4. **向后兼容存档**：兼容读取 `cat_push_progress_v2` / `cat_push_progress_v3` 并独立持久化 `cat_push_progression_v1`。
 
 1. **3 档难度模式系统（`easy` / `normal` / `hard`）**：
    - **简单（新手推荐，默认）**：`新手推荐 · 轻松爽推`，`maxRestoresPerWatch = 0`（无物归原位），`?` 预警 `1.05s`，最低安全背对间隔 `2.6s`。
@@ -33,12 +44,12 @@
 ## 4. 最新测试与构建结果
 
 - `npm.cmd --prefix D:\Codex\idea-lab\cat-push run typecheck`：通过（0 错误）。
-- `npm.cmd --prefix D:\Codex\idea-lab\cat-push test`：2 个测试文件、**47 项** Vitest 单元测试全部通过（`tests/rules.test.ts` 43 项 + `tests/world.test.ts` 4 项）。
-- `npm.cmd --prefix D:\Codex\idea-lab\cat-push run build`：通过（`dist/index.html` `0.60 kB`、`dist/assets/index-BifpYGoy.css` `0.44 kB`、`dist/assets/index-7dW98iRQ.js` `139.19 kB` / gzip `44.96 kB`）。
+- `npm.cmd --prefix D:\Codex\idea-lab\cat-push test`：3 个测试文件、**64 项** Vitest 单元测试全部通过（`tests/rules.test.ts` 44 项 + `tests/progression.test.ts` 16 项 + `tests/world.test.ts` 4 项）。
+- `npm.cmd --prefix D:\Codex\idea-lab\cat-push run build`：通过（`dist/index.html` `0.60 kB`、`dist/assets/index-BifpYGoy.css` `0.44 kB`、`dist/assets/index-BID6BbcX.js` `157.65 kB` / gzip `51.13 kB`）。
 - Playwright Chromium 三视口端到端验证（`360×640`、`390×844` 含 `?debug=1`、`1280×800`）：
   - 均满足 `fitsViewport: true`、`overflow: false`、0 控制台错误、0 页面异常、0 外部网络请求。
-  - 已验证右下角 `喵~ (E)`、`跳 (W)`、`轻拍! (Space)` 按钮布局清晰无遮挡，跳跃与卖萌打断效果正常。
+  - 已验证商店/图鉴交互、顶部 HUD `⏸` 暂停菜单与「退出到主页」闭环。
 
 ## 5. Git 状态
 
-- 独立 Git 仓库（`D:\Codex\idea-lab\cat-push`，基线 `a13e88a`），V2.0 Phase A 改动暂保留在本地工作区，待实机试玩确认后再提交推送。
+- 独立 Git 仓库（`D:\Codex\idea-lab\cat-push`），V2.0 Phase B1（含局内暂停与结算回主页）已完成验证并推送至 `origin/main`。

@@ -18,6 +18,7 @@ import {
   isFragileBrokenOnTable,
   pickRestoreTarget,
   recordItemDrop,
+  shouldAdvanceSimulation,
   shouldBlockCatHorizontally,
   stepCatJump,
   stepPhoneBuzz,
@@ -785,5 +786,38 @@ describe('3-Tier Difficulty Mode & Restore Rebalance (Phase A+)', () => {
       tuning,
     );
     expect(normalState.phase).toBe('RELAXED');
+  });
+
+  it('freezes simulation when paused and cleanly resets state when exiting to title', () => {
+    expect(shouldAdvanceSimulation('playing')).toBe(true);
+    expect(shouldAdvanceSimulation('paused')).toBe(false);
+    expect(shouldAdvanceSimulation('title')).toBe(false);
+    expect(shouldAdvanceSimulation('shop')).toBe(false);
+    expect(shouldAdvanceSimulation('codex')).toBe(false);
+    expect(shouldAdvanceSimulation('result')).toBe(false);
+
+    // When paused, simulation guard prevents advancing steward countdown or bill
+    let steward = createStewardState(tuning, 'normal');
+    let bill = createBillSummary();
+    bill = recordItemDrop(bill, 'mug', 2, tuning);
+    const beforeRemaining = steward.remainingSec;
+
+    if (shouldAdvanceSimulation('paused')) {
+      steward = stepSteward(
+        steward,
+        { dtSec: 1.0, playerActive: true, hasMovingItem: true, itemDroppedDuringStep: false, addedNoise: 50 },
+        tuning,
+      );
+    }
+    expect(steward.remainingSec).toBe(beforeRemaining);
+    expect(bill.totalScore).toBeGreaterThan(0);
+
+    // Exiting to title resets steward & bill cleanly
+    steward = createStewardState(tuning, 'normal');
+    bill = createBillSummary();
+    expect(steward.remainingSec).toBe(tuning.steward.roundDurationSec);
+    expect(steward.hearts).toBe(tuning.steward.maxHearts);
+    expect(bill.totalScore).toBe(0);
+    expect(bill.records).toHaveLength(0);
   });
 });

@@ -7,6 +7,7 @@ import {
   type ItemSpec,
   type Tuning,
 } from '../config/tuning';
+import type { EffectiveStats } from './progression';
 import {
   buildWaveLayout,
   calculateDropScore,
@@ -261,8 +262,13 @@ export class CatPushWorld {
     dtMs: number,
     difficulty: DifficultyMode = 'normal',
     excludeRestoreIds?: ReadonlySet<number>,
+    stats?: Partial<EffectiveStats>,
   ): WorldStepResult {
     const dtSec = dtMs / 1000;
+    const pawMult = stats?.pawMultiplier ?? 1;
+    const heavyMult = stats?.heavySpeedMultiplier ?? 1;
+    const noiseFactor = stats?.noiseFactor ?? 1;
+    const teeterScoreMult = stats?.teeterScoreMultiplier ?? 1;
     let addedNoise = 0;
     let pushingAny = false;
     let pushingHeavy = false;
@@ -300,7 +306,7 @@ export class CatPushWorld {
     const canTap = tapTriggered && this.cat.tapCooldownSec <= 0 && !jumpRes.isAirborne;
     if (canTap) {
       this.cat.tapCooldownSec = this.t.cat.tapCooldownSec;
-      addedNoise += this.t.cat.tapNoiseSpike;
+      addedNoise += this.t.cat.tapNoiseSpike * noiseFactor;
     }
 
     const activeInput = moveDir !== 0 || canTap || jumpRes.isAirborne;
@@ -399,26 +405,29 @@ export class CatPushWorld {
 
         if (canTap) {
           item.tapCoastSec = 0.26;
+          const itemBoost = pawMult * (item.spec.heavy ? heavyMult : 1);
           const tapSpeed = item.spec.heavy
-            ? clamp(item.spec.maxNudgeSpeed * 2.2 + 0.55, 0.85, 2.0)
+            ? clamp((item.spec.maxNudgeSpeed * 2.2 + 0.55) * itemBoost, 0.85, 2.8 * itemBoost)
             : clamp(
-                item.spec.maxNudgeSpeed * 1.45 +
-                  (this.t.cat.tapImpulseSpeedBoost * 0.001) / Math.max(item.spec.density, 0.0005),
+                (item.spec.maxNudgeSpeed * 1.45 +
+                  (this.t.cat.tapImpulseSpeedBoost * 0.001) / Math.max(item.spec.density, 0.0005)) *
+                  itemBoost,
                 1.4,
-                5.0,
+                6.2 * itemBoost,
               );
           Matter.Body.setVelocity(b, {
             x: Math.max(b.velocity.x, tapSpeed),
             y: b.velocity.y - (item.spec.heavy ? 0.18 : 0.35),
           });
         } else if (moveDir > 0) {
-          const targetVx = item.spec.maxNudgeSpeed;
+          const itemBoost = pawMult * (item.spec.heavy ? heavyMult : 1);
+          const targetVx = item.spec.maxNudgeSpeed * itemBoost;
           if (b.velocity.x < targetVx) {
             const accel = item.spec.heavy ? targetVx * 0.25 + 0.04 : targetVx * 0.32 + 0.14;
             const nextVx = Math.min(targetVx, b.velocity.x + accel);
             Matter.Body.setVelocity(b, { x: nextVx, y: b.velocity.y });
           }
-          addedNoise += item.spec.pushNoisePerSec * dtSec;
+          addedNoise += item.spec.pushNoisePerSec * noiseFactor * dtSec;
         }
       }
     }
@@ -548,7 +557,13 @@ export class CatPushWorld {
           item.dropped = true;
           item.settledAfterDrop = true;
           addedNoise += item.spec.dropNoise;
-          const score = calculateDropScore(item.kind, item.multiplier, false, this.t);
+          const score = calculateDropScore(
+            item.kind,
+            item.multiplier,
+            false,
+            this.t,
+            teeterScoreMult,
+          );
           droppedItems.push({
             kind: item.kind,
             x: b.position.x,

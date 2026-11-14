@@ -1,7 +1,22 @@
 import './style.css';
+import {
+  CAT_SKIN_IDS,
+  CODEX_ENTRIES,
+  UPGRADE_IDS,
+} from './config/progression';
 import { STAGES, STAGE_IDS, type GameMode, type StageId } from './config/stages';
 import { tuning, type DifficultyMode, type ItemKind } from './config/tuning';
 import { SoundEngine } from './game/audio';
+import {
+  calculateCanCoinsReward,
+  createInitialProgression,
+  getEffectiveStats,
+  purchaseOrEquipSkin,
+  purchaseUpgrade,
+  recordCodexDrops,
+  sanitizeProgression,
+  type ProgressionState,
+} from './game/progression';
 import {
   applyEndlessResult,
   applyStageResult,
@@ -10,10 +25,12 @@ import {
   createStewardState,
   evaluateStageStars,
   recordItemDrop,
+  shouldAdvanceSimulation,
   stepSteward,
   triggerMeowCharm,
   type BillSummary,
   type DifficultyProgress,
+  type ScreenMode,
   type StageProgress,
   type StewardState,
 } from './game/rules';
@@ -21,6 +38,8 @@ import { CatPushWorld } from './game/world';
 import { drawGameFrame, type FloatingText, type Particle } from './render/painter';
 
 const PROGRESS_KEY = 'cat_push_progress_v3';
+const LEGACY_PROGRESS_KEY_V2 = 'cat_push_progress_v2';
+const PROGRESSION_KEY = 'cat_push_progression_v1';
 
 function sanitizeDifficultyProgress(
   raw: Partial<DifficultyProgress> | undefined,
@@ -42,26 +61,56 @@ function sanitizeDifficultyProgress(
 }
 
 function readProgress(): StageProgress {
+  const base = createInitialProgress();
   try {
     const raw = window.localStorage.getItem(PROGRESS_KEY);
-    if (!raw) return createInitialProgress();
-    const parsed = JSON.parse(raw) as Partial<StageProgress>;
-    const base = createInitialProgress();
-    return {
-      byDifficulty: {
-        easy: sanitizeDifficultyProgress(parsed.byDifficulty?.easy, base.byDifficulty.easy),
-        normal: sanitizeDifficultyProgress(parsed.byDifficulty?.normal, base.byDifficulty.normal),
-        hard: sanitizeDifficultyProgress(parsed.byDifficulty?.hard, base.byDifficulty.hard),
-      },
-    };
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<StageProgress>;
+      return {
+        byDifficulty: {
+          easy: sanitizeDifficultyProgress(parsed.byDifficulty?.easy, base.byDifficulty.easy),
+          normal: sanitizeDifficultyProgress(parsed.byDifficulty?.normal, base.byDifficulty.normal),
+          hard: sanitizeDifficultyProgress(parsed.byDifficulty?.hard, base.byDifficulty.hard),
+        },
+      };
+    }
+    const legacyRaw = window.localStorage.getItem(LEGACY_PROGRESS_KEY_V2);
+    if (legacyRaw) {
+      const legacyParsed = JSON.parse(legacyRaw) as Partial<DifficultyProgress>;
+      return {
+        byDifficulty: {
+          ...base.byDifficulty,
+          normal: sanitizeDifficultyProgress(legacyParsed, base.byDifficulty.normal),
+        },
+      };
+    }
+    return base;
   } catch {
-    return createInitialProgress();
+    return base;
   }
 }
 
 function writeProgress(progress: StageProgress): void {
   try {
     window.localStorage.setItem(PROGRESS_KEY, JSON.stringify(progress));
+  } catch {
+    // Ignore storage failures in restricted contexts
+  }
+}
+
+function readProgression(): ProgressionState {
+  try {
+    const raw = window.localStorage.getItem(PROGRESSION_KEY);
+    if (!raw) return createInitialProgression();
+    return sanitizeProgression(JSON.parse(raw));
+  } catch {
+    return createInitialProgression();
+  }
+}
+
+function writeProgression(progression: ProgressionState): void {
+  try {
+    window.localStorage.setItem(PROGRESSION_KEY, JSON.stringify(progression));
   } catch {
     // Ignore storage failures in restricted contexts
   }
@@ -119,13 +168,18 @@ function main(): void {
 
   const sound = new SoundEngine();
   let progress = readProgress();
+  let progression = readProgression();
   let gameMode: GameMode = 'story';
   let difficulty: DifficultyMode = 'easy';
   let stageId: StageId = 1;
   let world = new CatPushWorld(tuning, STAGES[stageId].items);
   let steward: StewardState = createStewardState(tuning, difficulty);
   let bill: BillSummary = createBillSummary();
-  let screenMode: 'title' | 'playing' | 'result' = 'title';
+  let screenMode: ScreenMode = 'title';
+  let shopTab: 'upgrades' | 'skins' = 'upgrades';
+  let selectedCodexKind: ItemKind = 'tissue';
+  let lastEarnedCoins = 0;
+  let newlyCompletedCodex = false;
   let waveNumber = 1;
   const restoredThisWatch = new Set<number>();
 
@@ -200,22 +254,72 @@ function main(): void {
     floats.length = 0;
     shakeMag = 0;
     clearInputs();
+    accumulatorMs = 0;
+    lastTimeMs = performance.now();
     screenMode = 'playing';
+  }
+
+  function exitToTitle(): void {
+    const items = activeStageItems();
+    world = new CatPushWorld(tuning, items);
+    waveNumber = 1;
+    steward = createStewardState(tuning, difficulty);
+    bill = createBillSummary();
+    restoredThisWatch.clear();
+    particles.length = 0;
+    floats.length = 0;
+    shakeMag = 0;
+    clearInputs();
+    accumulatorMs = 0;
+    lastTimeMs = performance.now();
+    screenMode = 'title';
+  }
+
+  function togglePause(): void {
+    if (screenMode === 'playing') {
+      clearInputs();
+      screenMode = 'paused';
+    } else if (screenMode === 'paused') {
+      clearInputs();
+      accumulatorMs = 0;
+      lastTimeMs = performance.now();
+      screenMode = 'playing';
+    }
   }
 
   function finishMatch(endReason: StewardState['endReason']): void {
     steward = { ...steward, finished: true, endReason };
     screenMode = 'result';
     clearInputs();
+    let stars: 0 | 1 | 2 | 3 = 0;
+    let passedStory = false;
     if (gameMode === 'story') {
       const target = STAGES[stageId].targetScore;
-      const stars =
+      stars =
         endReason === 'hearts_zero' ? 0 : evaluateStageStars(bill.totalScore, target, steward.hearts);
+      passedStory = stars > 0;
       progress = applyStageResult(progress, difficulty, stageId, bill.totalScore, stars);
     } else {
       progress = applyEndlessResult(progress, difficulty, bill.totalScore);
     }
+
+    lastEarnedCoins = calculateCanCoinsReward({
+      totalScore: bill.totalScore,
+      dropCount: bill.records.length,
+      passedStory,
+      stars,
+      difficulty,
+    });
+    progression = {
+      ...progression,
+      canCoins: progression.canCoins + lastEarnedCoins,
+    };
+    const codexRes = recordCodexDrops(progression, bill.records);
+    progression = codexRes.state;
+    newlyCompletedCodex = codexRes.newlyCompletedCodex;
+
     writeProgress(progress);
+    writeProgression(progression);
   }
 
   function spawnDropEffects(
@@ -302,8 +406,8 @@ function main(): void {
     const pt = toLogicalCoords(e.clientX, e.clientY);
 
     if (screenMode === 'title') {
-      // 双模式切换 (y: 144..174)
-      if (pt.y >= 144 && pt.y <= 174) {
+      // 双模式切换 (y: 128..158)
+      if (pt.y >= 128 && pt.y <= 158) {
         if (pt.x >= 40 && pt.x <= 190) {
           gameMode = 'story';
           return;
@@ -313,8 +417,8 @@ function main(): void {
           return;
         }
       }
-      // 3 档难度切换 (y: 184..212)
-      if (pt.y >= 184 && pt.y <= 212) {
+      // 3 档难度切换 (y: 168..196)
+      if (pt.y >= 168 && pt.y <= 196) {
         let nextDiff: DifficultyMode | null = null;
         if (pt.x >= 40 && pt.x <= 140) nextDiff = 'easy';
         else if (pt.x >= 145 && pt.x <= 245) nextDiff = 'normal';
@@ -327,8 +431,8 @@ function main(): void {
           return;
         }
       }
-      // 4 关选关 (y: 242..302)
-      if (gameMode === 'story' && pt.y >= 242 && pt.y <= 302) {
+      // 4 关选关 (y: 226..286)
+      if (gameMode === 'story' && pt.y >= 226 && pt.y <= 286) {
         const unlockedStage = progress.byDifficulty[difficulty].unlockedStage;
         STAGE_IDS.forEach((id, idx) => {
           const sx = 34 + idx * 82;
@@ -338,9 +442,101 @@ function main(): void {
         });
         return;
       }
-      // 开始按钮 (y: 444..496)
-      if (pt.x >= 64 && pt.x <= tuning.view.width - 64 && pt.y >= 444 && pt.y <= 496) {
+      // 开始按钮 (y: 418..466)
+      if (pt.x >= 64 && pt.x <= tuning.view.width - 64 && pt.y >= 418 && pt.y <= 466) {
         startNewGame(stageId);
+        return;
+      }
+      // 商店与图鉴入口 (y: 478..518)
+      if (pt.y >= 478 && pt.y <= 518) {
+        if (pt.x >= 38 && pt.x <= 190) {
+          screenMode = 'shop';
+          return;
+        }
+        if (pt.x >= 200 && pt.x <= 352) {
+          screenMode = 'codex';
+          return;
+        }
+      }
+      return;
+    }
+
+    if (screenMode === 'shop') {
+      // 页签切换 (y: 96..126)
+      if (pt.y >= 96 && pt.y <= 126) {
+        if (pt.x >= 36 && pt.x <= 190) {
+          shopTab = 'upgrades';
+          return;
+        }
+        if (pt.x >= 200 && pt.x <= 354) {
+          shopTab = 'skins';
+          return;
+        }
+      }
+      // 购买/穿戴按钮 (x: 256..342)
+      if (pt.x >= 256 && pt.x <= 342) {
+        for (let idx = 0; idx < 4; idx++) {
+          const btnTop = 138 + idx * 94 + 22;
+          if (pt.y >= btnTop && pt.y <= btnTop + 40) {
+            if (shopTab === 'upgrades') {
+              const res = purchaseUpgrade(progression, UPGRADE_IDS[idx]);
+              if (res.purchased) {
+                progression = res.state;
+                writeProgression(progression);
+                sound.playMeow();
+              }
+            } else {
+              const res = purchaseOrEquipSkin(progression, CAT_SKIN_IDS[idx]);
+              if (res.changed) {
+                progression = res.state;
+                writeProgression(progression);
+                sound.playMeow();
+              }
+            }
+            return;
+          }
+        }
+      }
+      // 返回封面 (y: 528..574)
+      if (pt.x >= 64 && pt.x <= tuning.view.width - 64 && pt.y >= 528 && pt.y <= 574) {
+        screenMode = 'title';
+      }
+      return;
+    }
+
+    if (screenMode === 'codex') {
+      // 3x5 图鉴格子点击
+      for (let idx = 0; idx < CODEX_ENTRIES.length; idx++) {
+        const col = idx % 3;
+        const row = Math.floor(idx / 3);
+        const gx = 32 + col * 110;
+        const gy = 88 + row * 60;
+        if (pt.x >= gx && pt.x <= gx + 104 && pt.y >= gy && pt.y <= gy + 54) {
+          selectedCodexKind = CODEX_ENTRIES[idx].kind;
+          return;
+        }
+      }
+      // 返回封面 (y: 528..574)
+      if (pt.x >= 64 && pt.x <= tuning.view.width - 64 && pt.y >= 528 && pt.y <= 574) {
+        screenMode = 'title';
+      }
+      return;
+    }
+
+    if (screenMode === 'paused') {
+      if (pt.x >= 68 && pt.x <= tuning.view.width - 68) {
+        if (pt.y >= 258 && pt.y <= 304) {
+          togglePause();
+          return;
+        }
+        if (pt.y >= 314 && pt.y <= 360) {
+          startNewGame(stageId);
+          return;
+        }
+        if (pt.y >= 370 && pt.y <= 416) {
+          exitToTitle();
+          return;
+        }
       }
       return;
     }
@@ -350,19 +546,42 @@ function main(): void {
         gameMode === 'story' &&
         steward.endReason !== 'hearts_zero' &&
         bill.totalScore >= STAGES[stageId].targetScore;
-      if (passedStory && stageId < 4 && pt.x >= 64 && pt.x <= tuning.view.width - 64 && pt.y >= 404 && pt.y <= 452) {
-        startNewGame((stageId + 1) as StageId);
-        return;
-      }
-      if (pt.x >= 64 && pt.x <= tuning.view.width - 64 && pt.y >= 462 && pt.y <= 512) {
-        startNewGame(stageId);
+      const hasNextStage = passedStory && stageId < 4;
+      if (pt.x >= 64 && pt.x <= tuning.view.width - 64) {
+        if (hasNextStage) {
+          if (pt.y >= 388 && pt.y <= 432) {
+            startNewGame((stageId + 1) as StageId);
+            return;
+          }
+          if (pt.y >= 440 && pt.y <= 484) {
+            startNewGame(stageId);
+            return;
+          }
+          if (pt.y >= 492 && pt.y <= 536) {
+            exitToTitle();
+            return;
+          }
+        } else {
+          if (pt.y >= 416 && pt.y <= 464) {
+            startNewGame(stageId);
+            return;
+          }
+          if (pt.y >= 476 && pt.y <= 524) {
+            exitToTitle();
+            return;
+          }
+        }
       }
       return;
     }
 
-    // 静音按钮
-    if (Math.hypot(pt.x - (tuning.view.width - 30), pt.y - 38) <= 22) {
+    // 静音按钮 (width - 58, 38) 与暂停按钮 (width - 28, 38)
+    if (Math.hypot(pt.x - (tuning.view.width - 58), pt.y - 38) <= 15) {
       sound.muted = !sound.muted;
+      return;
+    }
+    if (Math.hypot(pt.x - (tuning.view.width - 28), pt.y - 38) <= 18) {
+      togglePause();
       return;
     }
 
@@ -426,7 +645,21 @@ function main(): void {
       return;
     }
 
-    if (screenMode !== 'playing') return;
+    if (screenMode === 'paused') {
+      if ((e.code === 'Escape' || e.code === 'KeyP') && !e.repeat) {
+        togglePause();
+      } else if (e.code === 'KeyR' && !e.repeat) {
+        startNewGame(stageId);
+      }
+      return;
+    }
+
+    if (!shouldAdvanceSimulation(screenMode)) return;
+
+    if ((e.code === 'Escape' || e.code === 'KeyP') && !e.repeat) {
+      togglePause();
+      return;
+    }
 
     sound.unlock();
     if (e.code === 'Space' && !e.repeat) {
@@ -487,7 +720,7 @@ function main(): void {
 
     shakeMag = Math.max(0, shakeMag - 28 * dtSec);
 
-    if (screenMode !== 'playing') return;
+    if (!shouldAdvanceSimulation(screenMode)) return;
 
     const moveDir = computeMoveDir();
     const didTap = tapQueued;
@@ -497,6 +730,8 @@ function main(): void {
     jumpQueued = false;
     meowQueued = false;
 
+    const stats = getEffectiveStats(progression);
+
     if (didTap) {
       sound.playTapPaw();
     }
@@ -504,7 +739,12 @@ function main(): void {
       sound.playJump();
     }
     if (didMeow) {
-      const charmRes = triggerMeowCharm(steward, tuning);
+      const charmRes = triggerMeowCharm(
+        steward,
+        tuning,
+        stats.meowCooldownSec,
+        stats.meowCharmBonusSec,
+      );
       if (charmRes.triggered) {
         steward = charmRes.state;
         world.cat.meowBubbleSec = 1.25;
@@ -522,13 +762,28 @@ function main(): void {
       }
     }
 
-    const worldRes = world.step(moveDir, didTap, didJump, dtMs, difficulty, restoredThisWatch);
+    const worldRes = world.step(
+      moveDir,
+      didTap,
+      didJump,
+      dtMs,
+      difficulty,
+      restoredThisWatch,
+      stats,
+    );
     if (worldRes.phoneBuzzed) {
       sound.playPhoneBuzz();
     }
 
     for (const drop of worldRes.droppedItems) {
-      bill = recordItemDrop(bill, drop.kind, drop.multiplier, tuning, drop.brokeOnTable);
+      bill = recordItemDrop(
+        bill,
+        drop.kind,
+        drop.multiplier,
+        tuning,
+        drop.brokeOnTable,
+        stats.teeterScoreMultiplier,
+      );
       sound.playCrash(drop.heavy);
       spawnDropEffects(
         drop.x,
@@ -566,6 +821,7 @@ function main(): void {
         teeteringItemLabel: worldRes.teeteringItemLabel,
         restoreCandidate: worldRes.restoreCandidate,
         enableTeeterSuspicion,
+        warningBonusSec: stats.warningBonusSec,
       },
       tuning,
     );
@@ -626,6 +882,11 @@ function main(): void {
         difficulty,
         stageId,
         progress,
+        progression,
+        shopTab,
+        selectedCodexKind,
+        lastEarnedCoins,
+        newlyCompletedCodex,
         steward,
         bill,
         muted: sound.muted,

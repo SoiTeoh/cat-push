@@ -1,6 +1,12 @@
 import type { StageId } from '../config/stages';
 import { tuning, type DifficultyMode, type ItemKind, type Tuning } from '../config/tuning';
 
+export type ScreenMode = 'title' | 'shop' | 'codex' | 'playing' | 'paused' | 'result';
+
+export function shouldAdvanceSimulation(screenMode: ScreenMode): boolean {
+  return screenMode === 'playing';
+}
+
 export type TeeterTier = 'safe' | 'teeter2' | 'teeter3';
 
 export interface TeeterResult {
@@ -136,12 +142,14 @@ export function calculateDropScore(
   multiplier: 1 | 2 | 3,
   brokeOnTable: boolean,
   t: Tuning = tuning,
+  teeterScoreMultiplier = 1,
 ): number {
   const base = t.items[kind].baseScore;
   if (brokeOnTable) {
     return Math.round(base * 0.5);
   }
-  return Math.round(base * multiplier);
+  const skinBonus = multiplier >= 2 ? teeterScoreMultiplier : 1;
+  return Math.round(base * multiplier * skinBonus);
 }
 
 export function createStewardState(
@@ -214,6 +222,8 @@ export function computeRestoredX(
 export function triggerMeowCharm(
   state: StewardState,
   t: Tuning = tuning,
+  cooldownOverrideSec?: number,
+  charmBonusSec = 0,
 ): { readonly state: StewardState; readonly triggered: boolean; readonly interruptedSteward: boolean } {
   if (state.finished || state.meowCooldownSec > 0) {
     return { state, triggered: false, interruptedSteward: false };
@@ -224,7 +234,8 @@ export function triggerMeowCharm(
   const nextUses = state.meowUsesThisRun + 1;
   const isResistant =
     diff.meowResistantAfterUses !== null && nextUses >= diff.meowResistantAfterUses;
-  const fullCharmSec = isResistant ? diff.meowResistantDurationSec : t.cat.meowCharmDurationSec;
+  const fullCharmSec =
+    (isResistant ? diff.meowResistantDurationSec : t.cat.meowCharmDurationSec) + charmBonusSec;
   return {
     triggered: true,
     interruptedSteward,
@@ -234,7 +245,7 @@ export function triggerMeowCharm(
       phaseTimerSec: interruptedSteward ? 0 : state.phaseTimerSec,
       relaxedElapsedSec: interruptedSteward ? 0 : state.relaxedElapsedSec,
       charmedTimerSec: interruptedSteward ? fullCharmSec : fullCharmSec * 0.5,
-      meowCooldownSec: t.cat.meowCooldownSec,
+      meowCooldownSec: cooldownOverrideSec ?? t.cat.meowCooldownSec,
       meowUsesThisRun: nextUses,
       meowResistant: isResistant,
       suspiciousTeeter: false,
@@ -305,6 +316,8 @@ export interface StewardStepInput {
   readonly restoreCandidate?: DisplacedItemSnapshot | null;
   /** 是否启用“悬边物品引发额外怀疑”（第 2 关起或无尽第 2 波起） */
   readonly enableTeeterSuspicion?: boolean;
+  /** 技能“奥斯卡演技”延长的 ? 预警窗口秒数 */
+  readonly warningBonusSec?: number;
   /** 0..1 的确定性或随机数，用于决定 WATCHING 持续时长 (1.8s..2.5s) */
   readonly watchRoll?: number;
   /** 0..1 的确定性或随机数，用于决定下次分心冷却 (14s..18s) */
@@ -377,7 +390,7 @@ export function stepSteward(
           : baseInterval;
         if (relaxedElapsedSec >= interval) {
           phase = 'WARNING';
-          phaseTimerSec = diff.warningDurationSec;
+          phaseTimerSec = diff.warningDurationSec + (input.warningBonusSec ?? 0);
           relaxedElapsedSec = 0;
         }
       }
@@ -706,8 +719,9 @@ export function recordItemDrop(
   multiplier: 1 | 2 | 3,
   t: Tuning = tuning,
   brokeOnTable = false,
+  teeterScoreMultiplier = 1,
 ): BillSummary {
-  const score = calculateDropScore(kind, multiplier, brokeOnTable, t);
+  const score = calculateDropScore(kind, multiplier, brokeOnTable, t, teeterScoreMultiplier);
   return {
     totalScore: bill.totalScore + score,
     counts: {
